@@ -19,3 +19,9 @@ MapleFlipper - מוצא אייטמים בחנויות שחקנים שמשתלם 
 
 אם F8 לא עובד כשהמשחק בפוקוס - מריצים את START.bat כמנהל (Run as administrator).
 "Update prices" - מוריד מחירים מחדש אחרי עדכון למשחק.
+
+טוקן GitHub (פעם אחת בכל מחשב, כי הריפו פרטי):
+ 1. https://github.com/settings/personal-access-tokens/new
+ 2. Repository access: Only select repositories -> MapleFlipper
+ 3. Permissions -> Contents: Read-only -> Generate token
+ 4. מעתיקים ומדביקים בחלון של START.bat כשהוא מבקש.
