@@ -313,11 +313,18 @@ class App:
         self.root.after(0, lambda: self.status.config(text=text))
 
     def start_hotkey(self):
-        try:
-            from pynput import keyboard
-            keyboard.GlobalHotKeys({"<f8>": lambda: self.root.after(0, self.scan)}).start()
-        except Exception:
-            pass
+        """System-wide F8 via RegisterHotKey, which games can't swallow like keyboard hooks."""
+        def loop():
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            if not user32.RegisterHotKey(None, 1, 0x4000, 0x77):  # MOD_NOREPEAT, VK_F8
+                self.say("F8 is taken by another program - use the SCAN button.")
+                return
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    self.root.after(0, self.scan)
+        threading.Thread(target=loop, daemon=True).start()
 
     # ---- prices
     def update_db(self):
