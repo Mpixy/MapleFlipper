@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.39"
+VERSION = "0.40"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -499,6 +499,26 @@ def find_npc_items(lines):
     return items
 
 
+def sale_combos(expects, total, most=6):
+    """Sets of items (indexes) whose expected NPC prices add up to `total` - selling several
+    things before the mesos are read again shows up as one big gain."""
+    order = sorted((i for i, e in enumerate(expects) if e), key=lambda i: -expects[i])
+    found = []
+
+    def walk(start, left, picked):
+        if left == 0 and picked:
+            found.append(tuple(sorted(picked)))
+            return
+        if len(picked) == most or len(found) > 40:
+            return
+        for k in range(start, len(order)):
+            i = order[k]
+            if expects[i] <= left:
+                walk(k + 1, left - expects[i], picked + [i])
+    walk(0, total, [])
+    return found
+
+
 def lost_digits(short, full):
     """True if `short` is `full` with 1-2 digits dropped (how OCR misreads prices)."""
     if not 1 <= len(full) - len(short) <= 2:
@@ -765,8 +785,9 @@ class App:
         self.track_btn.pack(side="left", padx=6)
         self.meso_lbl = ttk.Label(box, font=("Segoe UI", 12, "bold"), text="Mesos: -")
         self.meso_lbl.pack(anchor="w", padx=6)
-        self.tosell_lbl = ttk.Label(box, foreground="#b35c00", wraplength=520)
+        self.tosell_lbl = ttk.Label(box, foreground="#b35c00", wraplength=520, cursor="hand2")
         self.tosell_lbl.pack(anchor="w", padx=6)
+        self.tosell_lbl.bind("<Button-1>", lambda e: self.sell_dialog())
         self.stats_lbl = ttk.Label(box, foreground="#555")
         self.stats_lbl.pack(anchor="w", padx=6)
         self.hist = tk.Listbox(box, height=4, font=("Consolas", 10))
@@ -1304,10 +1325,15 @@ class App:
                 self.say(f"✓ Confirmed: '{item}' sold for {diff:,} exactly as predicted.")
                 self.refresh()
                 return
-        if len(self.bought) == 1:
+        combos = sale_combos([b[3] for b in self.bought], diff)
+        # the same names in a different order are the same answer (e.g. which of 3 Gold Earrings)
+        kinds = {tuple(sorted(self.bought[i][0] for i in c)) for c in combos}
+        if len(kinds) == 1:
+            self.sold_many(combos[0])
+        elif len(self.bought) == 1:
             self.apply_sale(0, diff)
         else:
-            self.ask_which_sold(diff)
+            self.sell_dialog(diff, combos[0] if combos else ())
 
     def sold(self, item):
         """Sold to the NPC: the 'BOUGHT' row is done."""
@@ -1334,7 +1360,7 @@ class App:
         if self.bought:
             todo = ", ".join(f"{b[0]} (+{b[3] - b[4]:,})" if b[3] is not None else b[0]
                              for b in self.bought)
-            self.tosell_lbl.config(text=f"To sell to an NPC: {todo}")
+            self.tosell_lbl.config(text=f"To sell to an NPC: {todo}   (click to mark sold)")
         else:
             self.tosell_lbl.config(text="To sell to an NPC: nothing")
         self.update_mini_mesos()
@@ -1389,15 +1415,79 @@ class App:
         self.say(f"Corrected: '{item}' sold for {got:,}, not {expect:,}. Price fixed for the future.")
         self.refresh()
 
-    def ask_which_sold(self, got):
-        top = tk.Toplevel(self.root)
-        top.title("What did you just sell?")
+    def sold_many(self, idxs, quiet=False):
+        """Several items sold together at their expected prices."""
+        done = []
+        for i in sorted(idxs, reverse=True):
+            item, _, qty, expect, paid = self.bought.pop(i)
+            self.record_flip(item, paid, expect if expect is not None else paid)
+            self.sold(item)
+            done.append(item)
+        self.save_stats()
+        if done and not quiet:
+            self.say(f"✓ Sold {len(done)} items: {', '.join(reversed(done))}")
+        self.refresh()
+        self.show_banner()
+
+    def drop_bought(self, idxs):
+        """Not sold through the tracker (sold earlier, kept it, dropped it): just forget them."""
+        for i in sorted(idxs, reverse=True):
+            self.sold(self.bought.pop(i)[0])
+        self.save_stats()
+        self.refresh()
+        self.show_banner()
+
+    def sell_dialog(self, got=None, preset=()):
+        """Tick what you sold. Opened after a sale the app couldn't match by itself, or by
+        clicking the 'Sell to NPC' list."""
+        if getattr(self, "sell_top", None) and self.sell_top.winfo_exists():
+            self.sell_top.destroy()
+        if not self.bought:
+            return
+        top = self.sell_top = tk.Toplevel(self.root)
+        top.title("What did you sell?")
         top.attributes("-topmost", True)
-        ttk.Label(top, text=f"You got {got:,} mesos. Which item did you sell?").pack(padx=10, pady=6)
+        head = (f"You got {got:,} mesos. Tick everything you sold:" if got
+                else "Tick what you already sold (or don't have any more):")
+        ttk.Label(top, text=head, font=("Segoe UI", 10, "bold")).pack(padx=10, pady=(8, 4), anchor="w")
+        total = ttk.Label(top, foreground="#555")
+        marks = []
+        lst = ttk.Frame(top)
+        lst.pack(fill="both", padx=10)
+
+        def recount(*_):
+            t = sum(b[3] or 0 for b, v in zip(self.bought, marks) if v.get())
+            ok = got and t == got
+            total.config(text=f"Ticked: {t:,}" + (f"  /  got {got:,}" if got else "") + ("  ✓" if ok else ""),
+                         foreground="#1a8f3a" if ok else "#555")
         for i, (item, _, qty, expect, paid) in enumerate(self.bought):
-            ttk.Button(top, text=f"{item}  (expected {expect:,})",
-                       command=lambda i=i: (top.destroy(), self.apply_sale(i, got))).pack(fill="x", padx=10, pady=2)
-        ttk.Button(top, text="Something else - ignore", command=top.destroy).pack(pady=8)
+            v = tk.BooleanVar(value=i in preset)
+            marks.append(v)
+            gain = "" if expect is None else f"   {expect:,}  ({expect - paid:+,})"
+            ttk.Checkbutton(lst, text=f"{item}{gain}", variable=v, command=recount).pack(anchor="w")
+        total.pack(padx=10, pady=4, anchor="w")
+        recount()
+        picked = lambda: [i for i, v in enumerate(marks) if v.get()]
+
+        def sold():
+            idxs = picked()
+            top.destroy()
+            if got and len(idxs) == 1:
+                self.apply_sale(idxs[0], got)  # one item: the real price is known now
+            else:
+                self.sold_many(idxs)
+
+        def remove():
+            idxs = picked()
+            top.destroy()
+            self.drop_bought(idxs)
+        row = ttk.Frame(top)
+        row.pack(fill="x", padx=10, pady=8)
+        ttk.Button(row, text="✓ Sold the ticked ones", command=sold).pack(side="left")
+        ttk.Button(row, text="Just remove them", command=remove).pack(side="left", padx=6)
+        ttk.Button(row, text="Clear all", command=lambda: (top.destroy(), self.drop_bought(range(len(self.bought))))
+                   ).pack(side="left")
+        ttk.Button(row, text="Cancel", command=top.destroy).pack(side="right")
 
     # ---- green frames drawn right on the game's shop window
     def draw_marks(self, box, marks):
@@ -1495,8 +1585,9 @@ class App:
         area = self.cfg.get("meso_area")
         if not area:
             return None
-        nums = [to_int(o["text"]) for o in ocr(grab(area) if img is None else img)]
-        nums = [n for n in nums if n is not None]
+        texts = [o["text"].replace(" ", "") for o in ocr(grab(area) if img is None else img)]
+        # only things that look like a mesos amount ("253,404"): not stray digits around it
+        nums = [to_int(t) for t in texts if GROUPED.match(t.strip(",."))]
         return max(nums) if nums else None
 
     def toggle_track(self):
@@ -1519,19 +1610,22 @@ class App:
             time.sleep(1.0)
             try:
                 img = grab(self.cfg["meso_area"])
-                if last_img is not None and hits >= 2 and np.array_equal(img, last_img):
+                if last_img is not None and pending == self.mesos and np.array_equal(img, last_img):
                     continue  # nothing changed on screen: skip the expensive OCR
                 last_img = img
                 v = self.read_mesos(img)
             except Exception:
                 v = None
             if v is not None:
-                # require 2 identical reads in a row so OCR glitches aren't logged
+                # require identical reads in a row so OCR glitches aren't logged; a value that
+                # looks like the old one with a digit lost/added has to hold much longer
                 if v == pending:
                     hits += 1
                 else:
                     pending, hits = v, 1
-                if hits == 2 and v != self.mesos:
+                old = self.mesos
+                glitch = old is not None and (lost_digits(str(v), str(old)) or lost_digits(str(old), str(v)))
+                if hits == (6 if glitch else 2) and v != old:
                     self.root.after(0, self.on_mesos, v)
 
     def on_mesos(self, v):
@@ -1545,8 +1639,7 @@ class App:
             kind = "SOLD to NPC / gained" if diff > 0 else "Spent / bought"
             stamp = time.strftime("%H:%M:%S")
             self.hist.insert(0, f"{stamp}  {diff:+12,}  {kind}")
-            self.say(f"Mesos changed {diff:+,} (now {v:,})")
-            self.learn_from_mesos(diff)
+            self.learn_from_mesos(diff)  # says something only when it is a buy / sale it recognises
             new_file = not os.path.exists(LOG_FILE)
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 if new_file:
@@ -1608,6 +1701,7 @@ class App:
                 op.add_command(label=f"{int(a * 100)}%", command=lambda a=a: self.set_mini_alpha(a))
             mm.add_cascade(label="See-through", menu=op)
             mm.add_command(label="Clear list", command=self.clear)
+            mm.add_command(label="Mark items as sold...", command=self.sell_dialog)
             mm.add_separator()
             mm.add_command(label="Quit", command=self.on_close)
             mm.tk_popup(e.x_root, e.y_root)
@@ -1617,6 +1711,10 @@ class App:
             w.bind("<B1-Motion>", drag)
             w.bind("<Double-1>", lambda e: self.toggle_mini())
             w.bind("<Button-3>", menu)
+        self.mini_sell.config(cursor="hand2")
+        self.mini_sell.bind("<Button-1>", lambda e: self.sell_dialog())
+        self.mini_sell.unbind("<B1-Motion>")
+        self.mini_sell.unbind("<Double-1>")
         pos = self.cfg.get("mini_pos")
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         if not pos or not (0 <= pos[0] < sw - 40 and 0 <= pos[1] < sh - 20):
@@ -1639,9 +1737,10 @@ class App:
         else:
             total = self.mesos - self.start_mesos
             self.mini_mesos.config(text=f"{self.mesos:,}   {total:+,}", fg="#5ee07a" if total >= 0 else "#ff6b6b")
-        todo = ", ".join(b[0] for b in self.bought)
-        if todo:
-            self.mini_sell.config(text=f"➜ Sell to NPC: {todo}")
+        names = [b[0] for b in self.bought]
+        if names:
+            todo = ", ".join(names[:3]) + (f" +{len(names) - 3} more" if len(names) > 3 else "")
+            self.mini_sell.config(text=f"➜ Sell to NPC: {todo}   (click = sold)")
             self.mini_sell.pack(fill="x", pady=(0, 3))
         else:
             self.mini_sell.pack_forget()
