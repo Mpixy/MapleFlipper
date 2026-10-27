@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.21"
+VERSION = "0.22"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -255,6 +255,30 @@ def grab(region=None):
     return np.ascontiguousarray(shot)
 
 
+def find_shop_button(img):
+    """Find the player-shop window (RGB image) by its orange BUY ITEM / LEAVE STORE buttons under the
+    lime SELLER INFO button. Returns the BUY ITEM centre in image pixels, or None."""
+    a = img[::2, ::2].astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    orange = (r > 170) & (g > 90) & (g < 175) & (b < 115) & (r - b > 100)
+    lime = (g > 150) & (r > 100) & (b < 170) & (g >= r - 5) & (g - b > 40)
+    c = 6
+    h, w = (orange.shape[0] // c) * c, (orange.shape[1] // c) * c
+    def cells(m):
+        return m[:h, :w].reshape(h // c, c, w // c, c).mean(axis=(1, 3))
+    oc, lc = cells(orange), cells(lime)
+    ys, xs = np.nonzero(oc > 0.35)
+    for y, x in zip(ys, xs):
+        # a wide orange bar: several orange cells in a row
+        if x + 5 >= oc.shape[1] or (oc[y, x:x + 6] > 0.3).sum() < 4:
+            continue
+        below = oc[y + 2:y + 6, x:x + 6] if y + 6 < oc.shape[0] else None   # LEAVE STORE
+        above = lc[max(y - 9, 0):max(y - 2, 0), x:x + 6]                       # SELLER INFO
+        if below is not None and (below > 0.3).sum() >= 3 and (above > 0.3).sum() >= 3:
+            return (x + 3) * c * 2, y * c * 2
+    return None
+
+
 def find_shop_items(lines):
     """Pair each 'N for X mesos' line with the item-name line right above it."""
     items = []
@@ -366,8 +390,8 @@ TRACK YOUR MESOS
 2. Click 'Set mesos area' and drag a box around the mesos number.
 3. Click 'Start tracking'. Every buy / NPC sale is logged with the profit.
 
-After the first F8 the app finds the shop window and rescans by itself
-when you scroll or open another shop (turn off with 'Auto').
+With 'Auto' on you don't need F8 at all: the app notices when you open
+a player shop and scans it, and rescans when you scroll.
 
 THE APP LEARNS
 - With mesos tracking on, buy an item and sell it to an NPC: the app checks
@@ -498,15 +522,33 @@ class App:
         messagebox.showinfo("How to use MapleFlipper", HELP_TEXT)
 
     def auto_loop(self):
-        """After the first F8 the app knows where the shop is; rescan by itself when it changes."""
-        last, stable = None, 0
+        """Finds a player shop by itself (orange BUY ITEM button) and rescans when it changes."""
+        last, stable, tried = None, 0, None
         while True:
             time.sleep(0.8)
-            box = self.shop_box
-            if not (box and self.auto.get()) or self.busy:
+            if not self.auto.get() or self.busy:
                 last = None
                 continue
+            box = self.shop_box
             try:
+                if not box:  # no shop known: look for one (cheap colour check, no OCR)
+                    time.sleep(0.7)
+                    with mss.mss() as sct:
+                        mon = sct.monitors[0]
+                    btn = find_shop_button(grab()[:, :, ::-1])  # screen grabs are BGR
+                    if not btn:
+                        tried = None
+                        continue
+                    if tried and abs(btn[0] - tried[0]) < 20 and abs(btn[1] - tried[1]) < 20:
+                        continue  # already looked here and it wasn't a shop
+                    tried = btn
+                    x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
+                    cand = {"left": max(x - 400, mon["left"]), "top": max(y - 40, mon["top"]),
+                            "width": 560, "height": 680}
+                    self.say("Shop window detected - scanning...")
+                    self.root.after(0, self.scan, True, cand)
+                    last = None
+                    continue
                 img = grab(box)
             except Exception:
                 continue
@@ -565,7 +607,7 @@ class App:
         return not (x > box["left"] + box["width"] or x + w < box["left"]
                     or y > box["top"] + box["height"] or y + h < box["top"])
 
-    def scan(self, auto=False):
+    def scan(self, auto=False, box=None):
         if self.busy:
             if not auto:
                 self.say("Still working on the previous scan - one moment...")
@@ -573,7 +615,7 @@ class App:
         self.busy = True
         if not auto:
             self.say("F8 pressed - reading the screen...")
-        box = self.shop_box
+        box = box or self.shop_box
         with mss.mss() as sct:
             full = sct.monitors[0]
         hide = self.overlaps_me(box or full)
@@ -610,6 +652,8 @@ class App:
                                      "top": int(max(y0 - 110, full["top"])),
                                      "width": 520, "height": int(y1 - y0 + 170)}
                 elif box and not items:
+                    if self.shop_box:
+                        self.say("Shop closed - waiting for the next shop.")
                     self.shop_box = None
                 new_good = False
                 for name, qty, price in items:
