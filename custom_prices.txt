@@ -1,0 +1,3 @@
+# Add or fix NPC prices here if MeowDB is missing one. Format:
+# Item Name = price
+# Work Gloves = 1800
