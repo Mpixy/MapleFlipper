@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.35"
+VERSION = "0.36"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -240,7 +240,8 @@ def ocr(img):
         if _ocr is None:
             from rapidocr_onnxruntime import RapidOCR
             try:
-                _ocr = RapidOCR(intra_op_num_threads=3, inter_op_num_threads=1)
+                _ocr = RapidOCR(intra_op_num_threads=max(2, min(6, (os.cpu_count() or 4) - 1)),
+                                inter_op_num_threads=1)
             except TypeError:
                 _ocr = RapidOCR()
         res, _ = _ocr(img, use_cls=False)  # text is never upside down: skip that step
@@ -298,19 +299,22 @@ def shop_rows(lines):
     return rows
 
 
-def read_price(crop):
-    """Read a 'N for X mesos' line twice: as is and enlarged. OCR sometimes drops a digit
-    ('2,999' -> '299'); the two reads then disagree. Returns (qty, price, sure) or None."""
+def read_price(crop, verify=True):
+    """Read a 'N for X mesos' line, and with verify=True a second time enlarged. OCR sometimes
+    drops a digit ('2,999' -> '299'); the two reads then disagree. Returns (qty, price, sure) or None."""
     import cv2  # comes with rapidocr
     reads = []
-    for im in (crop, cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)):
+    ims = [crop]
+    if verify:
+        ims.append(cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
+    for im in ims:
         m = PRICE_LINE.search(read_line(np.ascontiguousarray(im)))
         if m and to_int(m.group(1)) and to_int(m.group(2)):
             raw = m.group(2).strip(",.")
             reads.append((to_int(m.group(1)), to_int(raw), bool(GROUPED.match(raw))))
     if not reads:
         return None
-    if len(reads) == 2 and reads[0][:2] == reads[1][:2]:
+    if not verify or (len(reads) == 2 and reads[0][:2] == reads[1][:2]):
         return reads[0][0], reads[0][1], reads[0][2]
     # disagree (or only one read): prefer a well-formed number, then the longer one
     # (a lost digit is far more common than an invented one) - but don't trust it
@@ -318,9 +322,11 @@ def read_price(crop):
     return qty, price, False
 
 
-def read_rows(img, rows, width=320, seed=False):
+def read_rows(img, rows, width=320, seed=False, worth=None):
     """Read the shop rows at known places. Returns (name, qty, price, row rect, sure) per row.
-    seed=True stores the text the full scan already read, so nothing is read twice."""
+    seed=True stores the text the full scan already read, so nothing is read twice.
+    worth(name, qty, price) -> True: only those rows get the slower double-check of the price
+    (rows that aren't worth buying don't need it - that is most of them)."""
     items = []
     for (nx, ny, nh, ntext), (px, py, ph, ptext) in rows:
         if min(nx, ny, px, py) < 0 or ny + nh > img.shape[0] or py + ph > img.shape[0]:
@@ -330,11 +336,13 @@ def read_rows(img, rows, width=320, seed=False):
         if seed and ptext is not None:
             _rec_cache[hash(crops[0].tobytes())] = ptext
             _rec_cache[hash(crops[1].tobytes())] = ntext
-        got = read_price(crops[0])
+        got = read_price(crops[0], verify=worth is None)
         if not got:
             continue  # empty slot / tooltip in the way
         name = read_line(crops[1])
         qty, cost, sure = got
+        if worth and (not sure or worth(name, qty, cost)):
+            qty, cost, sure = read_price(crops[0]) or got
         if re.search(r"[A-Za-z]{2}", name):
             items.append((name, qty, cost, (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4)), sure))
     return items
@@ -645,6 +653,14 @@ class App:
         ttk.Button(r, text="🔍  SCAN THIS PAGE  (F8)", style="Big.TButton",
                    command=self.scan).pack(fill="x", padx=8, pady=(8, 4))
 
+        self.banner = tk.Label(r, text="Open a player shop - I'll find the deals.", font=("Segoe UI", 15, "bold"),
+                               bg="#e8e8e8", fg="#444", pady=8, wraplength=560)
+        self.banner.pack(fill="x", padx=8, pady=(0, 6))
+        self.shops_lbl = ttk.Label(r, foreground="#555", font=("Segoe UI", 9))
+        self.shops_lbl.pack(anchor="w", padx=10)
+        self.shops_today = 0
+        self.found_today = 0
+
         bar = ttk.Frame(r)
         bar.pack(fill="x", padx=8)
         ttk.Button(bar, text="Clear list", command=self.clear).pack(side="left")
@@ -907,13 +923,13 @@ class App:
                 t = time.time()
                 lines, items, rects, src, mark_box = [], [], [], img, box
                 if box and box is self.shop_box and self.rows:
-                    items = read_rows(img, self.rows)  # fast: known rows, cached text
+                    items = read_rows(img, self.rows, worth=self.worth)  # fast: known rows, cached text
                 if not items:
                     lines = ocr(img)
                     items = find_shop_items(lines)
                     if box and box is self.shop_box and items:
                         self.rows = shop_rows(lines)
-                        items = read_rows(img, self.rows, seed=True) or items
+                        items = read_rows(img, self.rows, seed=True, worth=self.worth) or items
                 rects = [it[3] for it in items if len(it) == 5]
                 items = [(it[0], it[1], it[2], it[-1]) for it in items]
                 img_origin = origin
@@ -943,7 +959,7 @@ class App:
                         sub = np.ascontiguousarray(sub)
                         shifted = [{**o, "x": o["x"] + dx, "y": o["y"] + dy} for o in lines]
                         self.rows = shop_rows(shifted)
-                        got = read_rows(sub, self.rows, seed=True)
+                        got = read_rows(sub, self.rows, seed=True, worth=self.worth)
                         if got:
                             items = [(it[0], it[1], it[2], it[4]) for it in got]
                             rects = [it[3] for it in got]
@@ -964,6 +980,12 @@ class App:
             self.busy = False
 
         threading.Thread(target=work, daemon=True).start()
+
+    def worth(self, name, qty, price):
+        """Would this row show up as profitable? (only those get their price double-checked)"""
+        real, _ = match_name(name, self.names, self.learned)
+        pays = self.npc_pays(real, qty) if real else None
+        return pays is None or pays - price > 0
 
     def unit_price(self, item):
         return self.learned.prices.get(item, self.prices.get(item))
@@ -995,15 +1017,40 @@ class App:
                 marks.append((rects[i], p))
         if mark_box and mark_box is self.shop_box:
             self.draw_marks(mark_box, marks)
+        best = max(marks, key=lambda m: m[1])[1] if marks else 0
+        if new_good:
+            self.found_today += sum(p for _, p in marks)
         if new_good and self.beep.get():
             import winsound
-            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            if best >= max(10000, 10 * self.min_p()):  # jackpot: a little fanfare
+                threading.Thread(target=lambda: [winsound.Beep(f, 90) for f in (660, 880, 1320)],
+                                 daemon=True).start()
+            else:
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        self.show_banner()
         self.refresh()
         n_good = sum(1 for k, v in self.seen.items() if (self.profit(v) or 0) > 0
                      and k not in self.unsure and k not in self.bought_keys)
         if items or not auto:
             self.say(("Page changed - " if auto else "") + f"Scan took {took:.1f}s. Found {len(items)} items. "
                      f"Profitable so far: {n_good}.")
+
+    def show_banner(self):
+        """One big line: what to buy in this shop right now (or: move on)."""
+        here = [(self.profit(v), v) for k, v in self.seen.items()
+                if self.seen_shop.get(k) == self.cur_shop and k not in self.unsure and k not in self.bought_keys]
+        here = [(p, v) for p, v in here if p is not None and p > 0 and p >= self.min_p()]
+        if here:
+            p, v = max(here, key=lambda x: x[0])
+            more = f"   (+{len(here) - 1} more, total +{sum(x[0] for x in here):,})" if len(here) > 1 else ""
+            hot = p >= max(10000, 10 * self.min_p())
+            self.banner.config(text=f"{'💰' if hot else '✅'} BUY: {v[0]}  for {v[3]:,}  →  +{p:,}{more}",
+                               bg="#ffd23f" if hot else "#2fb344", fg="#000" if hot else "#fff")
+        elif self.cur_shop:
+            self.banner.config(text=f"✖ Nothing here{' at ' + self.cur_shop if self.cur_shop else ''} - next shop!",
+                               bg="#e8e8e8", fg="#777")
+        self.shops_lbl.config(text=f"Shops checked this session: {self.shops_today}    "
+                                   f"Profit spotted: +{self.found_today:,}")
 
     def profit(self, v):
         real, _, qty, price = v
@@ -1161,6 +1208,7 @@ class App:
             self.bought.append([real, raw, qty, pays, spent])
             self.save_stats()
             self.root.after(0, self.refresh)
+            self.root.after(0, self.show_banner)
             res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
             fix = f" (the shop read {price:,} - fixed)" if price != spent else ""
             self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
@@ -1301,11 +1349,14 @@ class App:
         self.overlay.deiconify()
         c = self.ov_canvas
         c.delete("all")
+        best = max(p for _, p in marks)
         for (x, y, rw, rh), p in marks:
             x += pad
-            c.create_rectangle(x, y, x + rw, y + rh, outline="#00e000", width=3)
-            c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"+{p:,}",
-                          fill="#00c000", font=("Segoe UI", 11, "bold"))
+            top = p == best and len(marks) > 1
+            color = "#ffb000" if top else "#00e000"
+            c.create_rectangle(x, y, x + rw, y + rh, outline=color, width=4 if top else 3)
+            c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"{'★ ' if top else ''}+{p:,}",
+                          fill="#e09000" if top else "#00c000", font=("Segoe UI", 12 if top else 11, "bold"))
 
     def hide_marks(self):
         if getattr(self, "overlay", None):
@@ -1339,7 +1390,9 @@ class App:
                 del self.seen[key]
                 self.unsure.discard(key)
         self.cur_shop = seller
+        self.shops_today += 1
         self.refresh()
+        self.show_banner()
 
     def clear(self):
         self.seen = {k: v for k, v in self.seen.items() if k in self.bought_keys}
