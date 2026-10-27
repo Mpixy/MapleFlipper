@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.40"
+VERSION = "0.41"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -36,6 +36,7 @@ CONFIG_FILE = os.path.join(DATA, "config.json")
 LOG_FILE = os.path.join(DATA, "mesos_log.csv")
 LEARN_FILE = os.path.join(DATA, "learned.json")
 STATS_FILE = os.path.join(DATA, "flips.json")
+SHOPS_FILE = os.path.join(DATA, "shops.json")  # shops you visited: seller -> when, best profit
 REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
 REPO_SOURCE = "https://raw.githubusercontent.com/Mpixy/MapleFlipper/main/maple_flipper.py"
 BUNDLED_PRICES = os.path.join(getattr(sys, "_MEIPASS", HERE), "prices.json")
@@ -441,6 +442,11 @@ def seller_name(img, btn):
     return read_line(np.ascontiguousarray(tag))
 
 
+def ago(t):
+    m = int((time.time() - t) // 60)
+    return "just now" if m < 1 else f"{m} min ago" if m < 60 else f"{m // 60}h {m % 60:02d}m ago"
+
+
 def same_seller(a, b):
     return bool(a) and bool(b) and Levenshtein.distance(norm(a), norm(b)) <= 2
 
@@ -645,6 +651,10 @@ stays on top of the game and shows only what matters - what to buy, the
 mesos and your profit. Drag it anywhere; it remembers the spot. F9 again or
 double-click it for the full window. Right-click it for more.
 
+SHOPS YOU ALREADY CHECKED
+Walk into a shop you checked in the last 12 hours and the app tells you
+when, and what the best deal was ('Shops' button for the full list).
+
 Orange '(?)' = no price known for that item.
 Double-click any row to look the item up on MeowDB.
 Min profit = only highlight items that earn at least this much.
@@ -686,6 +696,8 @@ class App:
         self.unsure = set()  # item keys whose price was read differently twice: never 'profitable'
         self.bought_keys = {}  # item keys you bought (mesos tracker) -> mesos paid
         self.cur_shop = ""
+        self.shops = load_json(SHOPS_FILE, {})
+        self.revisit = None  # (when, best profit) of the current shop's last visit
         self.tracking = False
         self.mesos = self.start_mesos = None
         self.busy = self.updating = False
@@ -760,6 +772,7 @@ class App:
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
         ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
+        ttk.Button(bar, text="Shops", command=self.shops_window).pack(side="right", padx=(0, 6))
 
         cols = ("item", "qty", "price", "npc", "profit", "shop")
         self.tree = ttk.Treeview(r, columns=cols, show="headings", height=14)
@@ -1147,8 +1160,8 @@ class App:
             self.set_banner(f"{'💰' if hot else '✅'} BUY: {v[0]}  for {v[3]:,}  →  +{p:,}{more}",
                             "#ffd23f" if hot else "#2fb344", "#000" if hot else "#fff")
         elif self.cur_shop:
-            self.set_banner(f"✖ Nothing here{' at ' + self.cur_shop if self.cur_shop else ''} - next shop!",
-                            "#e8e8e8", "#777")
+            again = f"  (checked {ago(self.revisit[0])})" if self.revisit else ""
+            self.set_banner(f"✖ Nothing at {self.cur_shop}{again} - next shop!", "#e8e8e8", "#777")
         self.shops_lbl.config(text=f"Shops checked this session: {self.shops_today}    "
                                    f"Profit spotted: +{self.found_today:,}")
 
@@ -1548,6 +1561,7 @@ class App:
         self.cfg.update(tracking=self.tracking, marks=self.show_marks.get(),
                         geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
                         auto=self.auto.get(), mini=self.mini_on)
+        self.save_shop()
         if self.mini:
             self.cfg["mini_pos"] = [self.mini.winfo_x(), self.mini.winfo_y()]
         save_json(CONFIG_FILE, self.cfg)
@@ -1561,10 +1575,62 @@ class App:
             if (p is None or p <= 0 or p < self.min_p()) and key not in self.bought_keys:
                 del self.seen[key]
                 self.unsure.discard(key)
+        self.save_shop()  # the shop you just left
         self.cur_shop = seller
         self.shops_today += 1
+        name = self.known_shop(seller)
+        rec = self.shops.get(name) if name else None
+        self.revisit = None
+        if rec and time.time() - rec["t"] < 12 * 3600:
+            self.revisit = (rec["t"], rec["best"])
+            self.cur_shop = name  # same spelling as last time
+            best = f"best was +{rec['best']:,}" if rec["best"] > 0 else "nothing worth buying"
+            self.say(f"↺ {name}: you checked this shop {ago(rec['t'])} - {best}.")
         self.refresh()
-        self.show_banner()
+        if self.revisit:
+            self.set_banner(f"↺ {self.cur_shop}: checked {ago(self.revisit[0])} - "
+                            + (f"best was +{self.revisit[1]:,}" if self.revisit[1] else "nothing then"),
+                            "#5b6abf", "#fff")
+        else:
+            self.set_banner(f"🔍 Reading {seller or 'the shop'}...", "#e8e8e8", "#555")
+        self.shops_lbl.config(text=f"Shops checked this session: {self.shops_today}    "
+                                   f"Profit spotted: +{self.found_today:,}")
+
+    def known_shop(self, seller):
+        if not seller:
+            return None
+        if seller in self.shops:
+            return seller
+        return next((n for n in self.shops if same_seller(n, seller)), None)
+
+    def save_shop(self):
+        """Remember what the current shop had (best profit right now), for the next visit."""
+        if not self.cur_shop:
+            return
+        best = max([p for k, v in self.seen.items() if self.seen_shop.get(k) == self.cur_shop
+                    and k not in self.unsure and (p := self.profit(v)) is not None and p > 0] or [0])
+        self.shops[self.cur_shop] = {"t": time.time(), "best": best}
+        if len(self.shops) > 500:  # keep the newest
+            self.shops = dict(sorted(self.shops.items(), key=lambda kv: -kv[1]["t"])[:400])
+        save_json(SHOPS_FILE, self.shops)
+
+    def shops_window(self):
+        top = tk.Toplevel(self.root)
+        top.title("Shops you checked")
+        top.attributes("-topmost", True)
+        tv = ttk.Treeview(top, columns=("shop", "when", "best"), show="headings", height=16)
+        for c, t, w in (("shop", "Seller", 170), ("when", "Checked", 110), ("best", "Best deal", 100)):
+            tv.heading(c, text=t)
+            tv.column(c, width=w, anchor="w" if c == "shop" else "e")
+        tv.tag_configure("good", background="#b8f5b0")
+        tv.tag_configure("old", foreground="#999")
+        for name, rec in sorted(self.shops.items(), key=lambda kv: -kv[1]["t"])[:200]:
+            old = time.time() - rec["t"] > 12 * 3600
+            tv.insert("", "end", values=(name, ago(rec["t"]), f"+{rec['best']:,}" if rec["best"] else "nothing"),
+                      tags=("old",) if old else ("good",) if rec["best"] else ())
+        tv.pack(fill="both", expand=True, padx=8, pady=8)
+        ttk.Button(top, text="Forget all", command=lambda: (self.shops.clear(), save_json(SHOPS_FILE, {}),
+                                                            top.destroy())).pack(pady=(0, 8))
 
     def clear(self):
         self.seen = {k: v for k, v in self.seen.items() if k in self.bought_keys}
@@ -1702,6 +1768,7 @@ class App:
             mm.add_cascade(label="See-through", menu=op)
             mm.add_command(label="Clear list", command=self.clear)
             mm.add_command(label="Mark items as sold...", command=self.sell_dialog)
+            mm.add_command(label="Shops you checked...", command=self.shops_window)
             mm.add_separator()
             mm.add_command(label="Quit", command=self.on_close)
             mm.tk_popup(e.x_root, e.y_root)
