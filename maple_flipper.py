@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "1.5"
+VERSION = "1.6"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -39,7 +39,7 @@ ITEM_URL = "https://meowdb.com/msclassic/item-db/{}"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"}
 
-PRICE_LINE = re.compile(r"(\d[\d,.]*)\s*f[o0]r\s*(\d[\d,.]*)\s*m", re.I)
+PRICE_LINE = re.compile(r"^\s*(\d[\d,.]*)\s*f[o0]r\s*(\d[\d,.]*)\s*m", re.I)
 
 
 def to_int(s):
@@ -58,6 +58,17 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
+
+
+def log_error(etype, value, tb):
+    """pythonw has no console, so keep crashes in a file we can look at."""
+    import traceback
+    with open(os.path.join(DATA, "error_log.txt"), "a", encoding="utf-8") as f:
+        f.write(time.strftime("\n%Y-%m-%d %H:%M:%S\n") + "".join(traceback.format_exception(etype, value, tb)))
+
+
+sys.excepthook = log_error
+threading.excepthook = lambda a: log_error(a.exc_type, a.exc_value, a.exc_traceback)
 
 
 # ---------------------------------------------------------------- price database
@@ -102,10 +113,12 @@ def update_prices(progress, max_id=12000, path=PRICES_FILE):
     """Crawl MeowDB item pages by number. Ids are not contiguous, so scan a wide range."""
     db = load_json(path, {})
     session = requests.Session()
-    found, misses, stats = 0, 0, {}
+    state_file = path + ".progress"
+    state = load_json(state_file, {"next": 1, "found": 0, "misses": 0})  # resume a cut-off download
+    first, found, misses, stats = state["next"], state["found"], state["misses"], {}
     t0 = time.time()
     with cf.ThreadPoolExecutor(10) as pool:
-        for start in range(1, max_id, 50):
+        for start in range(first, max_id, 50):
             for iid, res in pool.map(lambda i: fetch_item(session, i), range(start, start + 50)):
                 if isinstance(res, tuple):
                     db[res[0]] = res[1]
@@ -114,17 +127,19 @@ def update_prices(progress, max_id=12000, path=PRICES_FILE):
                     stats[res] = stats.get(res, 0) + 1
                     misses += 1
             done = start + 49
-            left = (time.time() - t0) / done * (max_id - done)
+            left = (time.time() - t0) / max(done - first + 1, 1) * (max_id - done)
             progress(f"Downloading prices... {done * 100 // max_id}%  ({done:,}/{max_id:,} checked, "
                      f"{found:,} items found)  ~{int(left // 60)}:{int(left % 60):02d} left at most", done / max_id)
             if found and misses > 2500:
                 break  # well past the last item
-            if found % 500 < 50:
-                save_json(path, db)
+            save_json(path, db)
+            save_json(state_file, {"next": start + 50, "found": found, "misses": misses})
     with open(os.path.join(DATA, "update_log.txt"), "w", encoding="utf-8") as f:
         f.write(f"found={found} total={len(db)} misses={stats}\n")
     if db:
         save_json(path, db)
+    if os.path.exists(state_file):
+        os.remove(state_file)
     return found, len(db)
 
 
@@ -279,6 +294,8 @@ TRACK YOUR MESOS
 3. Click 'Start tracking'. Every buy / NPC sale is logged with the profit.
 
 Orange '(?)' = no price known for that item.
+Double-click any row to look the item up on MeowDB.
+Min profit = only highlight items that earn at least this much.
 'Update prices' = refresh prices after a game patch."""
 
 
@@ -289,16 +306,20 @@ class App:
         self.root.attributes("-topmost", True)
         self.root.geometry("560x620")
         self.cfg = load_json(CONFIG_FILE, {})
+        if self.cfg.get("geometry"):
+            self.root.geometry(self.cfg["geometry"])
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.report_callback_exception = lambda *exc: log_error(*exc)
         self.prices = load_prices()
         self.names = list(self.prices)
         self.seen = {}
         self.tracking = False
         self.mesos = self.start_mesos = None
-        self.busy = False
+        self.busy = self.updating = False
         self.build_ui()
         self.root.bind_all("<F8>", lambda e: self.scan())
         self.start_hotkey()
-        if len(self.prices) < 500:  # first run or an incomplete download
+        if len(self.prices) < 500 or os.path.exists(PRICES_FILE + ".progress"):  # first run / cut off
             self.root.after(300, self.update_db)
         else:
             self.say(f"Ready - {len(self.prices):,} item prices loaded. Open a player shop and press F8.")
@@ -321,6 +342,13 @@ class App:
         self.only_profit = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="Only profitable", variable=self.only_profit,
                         command=self.refresh).pack(side="left", padx=8)
+        ttk.Label(bar, text="Min profit:").pack(side="left")
+        self.min_profit = tk.StringVar(value=str(self.cfg.get("min_profit", 0)))
+        e = ttk.Entry(bar, textvariable=self.min_profit, width=8)
+        e.pack(side="left", padx=(2, 8))
+        e.bind("<KeyRelease>", lambda ev: self.refresh())
+        self.beep = tk.BooleanVar(value=self.cfg.get("beep", True))
+        ttk.Checkbutton(bar, text="Beep", variable=self.beep).pack(side="left")
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
 
@@ -334,6 +362,7 @@ class App:
         self.tree.tag_configure("bad", foreground="#999")
         self.tree.tag_configure("unknown", foreground="#c07000")
         self.tree.pack(fill="both", expand=True, padx=8, pady=6)
+        self.tree.bind("<Double-1>", self.open_item)
 
         box = ttk.LabelFrame(r, text="Mesos tracker")
         box.pack(fill="x", padx=8, pady=4)
@@ -380,9 +409,9 @@ class App:
 
     # ---- prices
     def update_db(self):
-        if self.busy:
+        if self.updating:
             return
-        self.busy = True
+        self.updating = True
 
         def work():
             try:
@@ -394,8 +423,9 @@ class App:
                 else:
                     self.say(f"Prices updated: {total} items.")
             except Exception as e:
-                self.say(f"Price update failed: {e}")
-            self.busy = False
+                log_error(type(e), e, e.__traceback__)
+                self.say(f"Price update failed: {e} - progress is saved, it will continue next time.")
+            self.updating = False
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -416,14 +446,24 @@ class App:
         def work():
             try:
                 items = find_shop_items(ocr(img))
+                new_good = False
                 for name, qty, price in items:
                     real, score = match_name(name, self.names)
-                    self.seen[(real or name, price)] = (real, name, qty, price)
+                    key = (real or name, price)
+                    v = (real, name, qty, price)
+                    p = self.profit(v)
+                    if key not in self.seen and p is not None and p > 0 and p >= self.min_p():
+                        new_good = True
+                    self.seen[key] = v
+                if new_good and self.beep.get():
+                    import winsound
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
                 self.root.after(0, self.refresh)
                 n_good = sum(1 for v in self.seen.values() if self.profit(v) and self.profit(v) > 0)
                 self.say(f"Found {len(items)} items on screen. Profitable so far: {n_good}. "
                          f"Scroll the shop and scan again for more.")
             except Exception as e:
+                log_error(type(e), e, e.__traceback__)
                 self.say(f"Scan failed: {e}")
             self.busy = False
 
@@ -441,14 +481,31 @@ class App:
         for v in rows:
             real, raw, qty, price = v
             p = self.profit(v)
-            if self.only_profit.get() and (p is None or p <= 0):
+            if self.only_profit.get() and (p is None or p <= 0 or p < self.min_p()):
                 continue
             if p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-"), "unknown"
             else:
                 vals = (real, qty, f"{price:,}", f"{npc_value(real, self.prices[real], qty):,}", f"{p:+,}")
-                tag = "good" if p > 0 else "bad"
+                tag = "good" if p > 0 and p >= self.min_p() else "bad"
             self.tree.insert("", "end", values=vals, tags=(tag,))
+
+    def min_p(self):
+        return to_int(self.min_profit.get()) or 0
+
+    def open_item(self, _event):
+        sel = self.tree.selection()
+        if sel:
+            import urllib.parse
+            import webbrowser
+            name = self.tree.item(sel[0], "values")[0].replace(" (?)", "")
+            webbrowser.open("https://www.google.com/search?q=" +
+                            urllib.parse.quote(f"site:meowdb.com/msclassic {name}"))
+
+    def on_close(self):
+        self.cfg.update(geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get())
+        save_json(CONFIG_FILE, self.cfg)
+        self.root.destroy()
 
     def clear(self):
         self.seen.clear()
