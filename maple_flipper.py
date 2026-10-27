@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.26"
+VERSION = "0.27"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -270,24 +270,30 @@ def shop_rows(lines):
                  and 0 < ln["y"] - o["y"] < 2.5 * max(ln["h"], 12)]
         if above:
             nm = max(above, key=lambda o: o["y"])
-            rows.append([(int(r["x"]) - 4, int(r["y"] - r["h"] / 2) - 3, int(r["h"]) + 6)
+            rows.append([(int(r["x"]) - 4, int(r["y"] - r["h"] / 2) - 3, int(r["h"]) + 6, r["text"])
                          for r in (nm, ln)])
     return rows
 
 
-def read_rows(img, rows, width=320):
+def read_rows(img, rows, width=320, seed=False):
+    """Read the shop rows at known places. Returns (name, qty, price, row rect) per row.
+    seed=True stores the text the full scan already read, so nothing is read twice."""
     items = []
-    for (nx, ny, nh), (px, py, ph) in rows:
+    for (nx, ny, nh, ntext), (px, py, ph, ptext) in rows:
         if min(nx, ny, px, py) < 0 or ny + nh > img.shape[0] or py + ph > img.shape[0]:
             return []
-        price = read_line(np.ascontiguousarray(img[py:py + ph, px:px + width]))
-        m = PRICE_LINE.search(price)
+        crops = [np.ascontiguousarray(img[y:y + h, x:x + width])
+                 for x, y, h in ((px, py, ph), (nx, ny, nh))]
+        if seed:
+            _rec_cache[hash(crops[0].tobytes())] = ptext
+            _rec_cache[hash(crops[1].tobytes())] = ntext
+        m = PRICE_LINE.search(read_line(crops[0]))
         if not m:
             continue  # empty slot / tooltip in the way
-        name = read_line(np.ascontiguousarray(img[ny:ny + nh, nx:nx + width]))
+        name = read_line(crops[1])
         qty, cost = to_int(m.group(1)), to_int(m.group(2))
         if qty and cost and re.search(r"[A-Za-z]{2}", name):
-            items.append((name, qty, cost))
+            items.append((name, qty, cost, (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4))))
     return items
 
 
@@ -473,6 +479,9 @@ THE APP LEARNS
 - Right-click a row to say 'wrong item', pick the right one, or type the
   real NPC price. It remembers forever.
 
+Green frames are drawn right on the game's shop rows with the profit
+(turn off with 'Marks'). A new shop starts a fresh list automatically.
+
 Orange '(?)' = no price known for that item.
 Double-click any row to look the item up on MeowDB.
 Min profit = only highlight items that earn at least this much.
@@ -511,6 +520,8 @@ class App:
             self.root.after(300, self.update_db)
         else:
             self.say(f"Ready - {len(self.prices):,} item prices loaded. Open a player shop and press F8.")
+        if self.cfg.get("tracking") and self.cfg.get("meso_area"):
+            self.root.after(800, self.toggle_track)  # was tracking last time: keep going
         if not self.cfg.get("seen_help"):
             self.cfg["seen_help"] = True
             save_json(CONFIG_FILE, self.cfg)
@@ -545,6 +556,9 @@ class App:
         e = ttk.Entry(bar, textvariable=self.min_profit, width=8)
         e.pack(side="left", padx=(2, 8))
         e.bind("<KeyRelease>", lambda ev: self.refresh())
+        self.show_marks = tk.BooleanVar(value=self.cfg.get("marks", True))
+        ttk.Checkbutton(bar, text="Marks", variable=self.show_marks,
+                        command=lambda: self.show_marks.get() or self.hide_marks()).pack(side="left", padx=(0, 6))
         self.auto = tk.BooleanVar(value=self.cfg.get("auto", True))
         ttk.Checkbutton(bar, text="Auto", variable=self.auto).pack(side="left", padx=(0, 6))
         self.beep = tk.BooleanVar(value=self.cfg.get("beep", True))
@@ -617,6 +631,7 @@ class App:
                                                        or abs(btn[1] - self.shop_btn[1]) > 20)
                     if not btn or moved:
                         self.shop_box, last, tried = None, None, None
+                        self.root.after(0, self.hide_marks)
                         self.say("Shop closed - waiting for the next shop.")
                         continue
                 if not box:  # no shop known: look for one (cheap colour check, no OCR)
@@ -633,6 +648,8 @@ class App:
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     cand = {"left": max(x - 400, mon["left"]), "top": max(y - 40, mon["top"]),
                             "width": 560, "height": 680}
+                    if self.cfg.get("auto_clear", True):
+                        self.root.after(0, self.clear)  # new shop: start a fresh list
                     self.say("Shop detected - reading it...")
                     self.root.after(0, self.scan, True, cand)
                     last = None
@@ -724,14 +741,17 @@ class App:
                 if _ocr is None:
                     self.say("Loading the text reader (first scan only, a few seconds)...")
                 t = time.time()
-                lines, items = [], []
+                lines, items, rects = [], [], []
                 if box and box is self.shop_box and self.rows:
                     items = read_rows(img, self.rows)  # fast: known rows, cached text
                 if not items:
                     lines = ocr(img)
                     items = find_shop_items(lines)
-                    if box and items:
+                    if box and box is self.shop_box and items:
                         self.rows = shop_rows(lines)
+                        items = read_rows(img, self.rows, seed=True) or items
+                rects = [it[3] for it in items if len(it) == 4]
+                items = [it[:3] for it in items]
                 img_origin = origin
                 if not items and (not self.shop_box or not auto):
                     # not a player shop here: read the whole screen (shop moved, or an NPC shop)
@@ -752,8 +772,8 @@ class App:
                     self.rows = []  # new box: learn the row positions on the next scan
                 elif box and not items and not auto:
                     self.shop_box = None
-                new_good = False
-                for name, qty, price in items:
+                new_good, marks = False, []
+                for i, (name, qty, price) in enumerate(items):
                     real, score = match_name(name, self.names, self.learned)
                     key = (real or name, price)
                     v = (real, name, qty, price)
@@ -761,6 +781,10 @@ class App:
                     if key not in self.seen and p is not None and p > 0 and p >= self.min_p():
                         new_good = True
                     self.seen[key] = v
+                    if rects and p is not None and p > 0 and p >= self.min_p():
+                        marks.append((rects[i], p))
+                if box and box is self.shop_box:
+                    self.root.after(0, self.draw_marks, box, marks)
                 if new_good and self.beep.get():
                     import winsound
                     winsound.MessageBeep(winsound.MB_ICONASTERISK)
@@ -976,6 +1000,41 @@ class App:
                        command=lambda i=i: (top.destroy(), self.apply_sale(i, got))).pack(fill="x", padx=10, pady=2)
         ttk.Button(top, text="Something else - ignore", command=top.destroy).pack(pady=8)
 
+    # ---- green frames drawn right on the game's shop window
+    def draw_marks(self, box, marks):
+        if not self.show_marks.get() or not marks or box is not self.shop_box:
+            self.hide_marks()
+            return
+        if not getattr(self, "overlay", None):
+            ov = tk.Toplevel(self.root)
+            ov.overrideredirect(True)
+            ov.attributes("-topmost", True)
+            ov.configure(bg="#ff00ff")
+            ov.attributes("-transparentcolor", "#ff00ff")
+            self.ov_canvas = tk.Canvas(ov, bg="#ff00ff", highlightthickness=0)
+            self.ov_canvas.pack(fill="both", expand=True)
+            ov.update_idletasks()
+            try:  # let mouse clicks pass through to the game
+                hwnd = ctypes.windll.user32.GetParent(ov.winfo_id())
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+                ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
+            except Exception:
+                pass
+            self.overlay = ov
+        w = box["width"] + 140
+        self.overlay.geometry(f"{w}x{box['height']}+{box['left']}+{box['top']}")
+        self.overlay.deiconify()
+        c = self.ov_canvas
+        c.delete("all")
+        for (x, y, rw, rh), p in marks:
+            c.create_rectangle(x, y, x + rw, y + rh, outline="#00e000", width=3)
+            c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"+{p:,}",
+                          fill="#00c000", font=("Segoe UI", 11, "bold"))
+
+    def hide_marks(self):
+        if getattr(self, "overlay", None):
+            self.overlay.withdraw()
+
     def min_p(self):
         return to_int(self.min_profit.get()) or 0
 
@@ -989,7 +1048,8 @@ class App:
                             urllib.parse.quote(f"site:meowdb.com/msclassic {name}"))
 
     def on_close(self):
-        self.cfg.update(geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
+        self.cfg.update(tracking=self.tracking, marks=self.show_marks.get(),
+                        geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
                         auto=self.auto.get())
         save_json(CONFIG_FILE, self.cfg)
         self.root.destroy()
