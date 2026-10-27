@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.37"
+VERSION = "0.38"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -608,6 +608,12 @@ Green frames are drawn right on the game's shop rows with the profit
 list. When you move on, profitable items stay (Shop column shows '← seller')
 until you buy them; the rest is dropped.
 
+ONE SCREEN? USE MINI MODE
+Press F9 (or the 'Mini' button): the big window turns into a small bar that
+stays on top of the game and shows only what matters - what to buy, the
+mesos and your profit. Drag it anywhere; it remembers the spot. F9 again or
+double-click it for the full window. Right-click it for more.
+
 Orange '(?)' = no price known for that item.
 Double-click any row to look the item up on MeowDB.
 Min profit = only highlight items that earn at least this much.
@@ -652,8 +658,12 @@ class App:
         self.tracking = False
         self.mesos = self.start_mesos = None
         self.busy = self.updating = False
+        self.mini = None
+        self.mini_on = False
         self.build_ui()
         self.show_stats()
+        if self.cfg.get("mini"):
+            self.root.after(200, self.toggle_mini)
         self.root.bind_all("<F8>", lambda e: self.scan())
         self.start_hotkey()
         threading.Thread(target=self.auto_loop, daemon=True).start()
@@ -718,6 +728,7 @@ class App:
         ttk.Checkbutton(bar, text="Beep", variable=self.beep).pack(side="left")
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
+        ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
 
         cols = ("item", "qty", "price", "npc", "profit", "shop")
         self.tree = ttk.Treeview(r, columns=cols, show="headings", height=14)
@@ -755,6 +766,8 @@ class App:
     def say(self, text, pct=None):
         def ui():
             self.status.config(text=text)
+            if self.mini:
+                self.mini_status.config(text=text)
             if pct is None:
                 self.pbar.pack_forget()
             else:
@@ -882,12 +895,16 @@ class App:
         """Poll the real key state: works even when the game swallows the key press."""
         def loop():
             user32 = ctypes.windll.user32
-            was_down = False
+            was_down = was9 = False
             while True:
                 down = bool(user32.GetAsyncKeyState(0x77) & 0x8000)  # VK_F8
                 if down and not was_down:
                     self.root.after(0, self.scan)
                 was_down = down
+                d9 = bool(user32.GetAsyncKeyState(0x78) & 0x8000)  # VK_F9: mini / full window
+                if d9 and not was9:
+                    self.root.after(0, self.toggle_mini)
+                was9 = d9
                 time.sleep(0.03)
         threading.Thread(target=loop, daemon=True).start()
 
@@ -919,8 +936,11 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     # ---- shop scan
+    def visible_win(self):
+        return self.mini if self.mini_on else self.root
+
     def overlaps_me(self, box):
-        r = self.root
+        r = self.visible_win()
         x, y, w, h = r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height()
         return not (x > box["left"] + box["width"] or x + w < box["left"]
                     or y > box["top"] + box["height"] or y + h < box["top"])
@@ -938,7 +958,7 @@ class App:
             full = sct.monitors[0]
         hide = self.overlaps_me(box or full)
         if hide:
-            self.root.attributes("-alpha", 0.0)  # don't OCR our own window
+            self.visible_win().attributes("-alpha", 0.0)  # don't OCR our own window
             self.root.update()
             time.sleep(0.1)
         try:
@@ -950,7 +970,7 @@ class App:
             return
         finally:
             if hide:
-                self.root.attributes("-alpha", 1.0)
+                self.visible_win().attributes("-alpha", self.mini_alpha() if self.mini_on else 1.0)
         origin = box or full
 
         def work():
@@ -1072,6 +1092,11 @@ class App:
             self.say(("Page changed - " if auto else "") + f"Scan took {took:.1f}s. Found {len(items)} items. "
                      f"Profitable so far: {n_good}.")
 
+    def set_banner(self, text, bg, fg):
+        self.banner.config(text=text, bg=bg, fg=fg)
+        if self.mini:
+            self.mini_deal.config(text=text, bg=bg, fg=fg)
+
     def show_banner(self):
         """One big line: what to buy in this shop right now (or: move on)."""
         here = [(self.profit(v), v) for k, v in self.seen.items()
@@ -1081,11 +1106,11 @@ class App:
             p, v = max(here, key=lambda x: x[0])
             more = f"   (+{len(here) - 1} more, total +{sum(x[0] for x in here):,})" if len(here) > 1 else ""
             hot = p >= max(10000, 10 * self.min_p())
-            self.banner.config(text=f"{'💰' if hot else '✅'} BUY: {v[0]}  for {v[3]:,}  →  +{p:,}{more}",
-                               bg="#ffd23f" if hot else "#2fb344", fg="#000" if hot else "#fff")
+            self.set_banner(f"{'💰' if hot else '✅'} BUY: {v[0]}  for {v[3]:,}  →  +{p:,}{more}",
+                            "#ffd23f" if hot else "#2fb344", "#000" if hot else "#fff")
         elif self.cur_shop:
-            self.banner.config(text=f"✖ Nothing here{' at ' + self.cur_shop if self.cur_shop else ''} - next shop!",
-                               bg="#e8e8e8", fg="#777")
+            self.set_banner(f"✖ Nothing here{' at ' + self.cur_shop if self.cur_shop else ''} - next shop!",
+                            "#e8e8e8", "#777")
         self.shops_lbl.config(text=f"Shops checked this session: {self.shops_today}    "
                                    f"Profit spotted: +{self.found_today:,}")
 
@@ -1295,6 +1320,7 @@ class App:
             self.tosell_lbl.config(text=f"To sell to an NPC: {todo}")
         else:
             self.tosell_lbl.config(text="To sell to an NPC: nothing")
+        self.update_mini_mesos()
 
     def learn_npc(self, rows):
         """An NPC shop shows the real price for everything you could sell (and the Buy Back
@@ -1414,7 +1440,9 @@ class App:
     def on_close(self):
         self.cfg.update(tracking=self.tracking, marks=self.show_marks.get(),
                         geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
-                        auto=self.auto.get())
+                        auto=self.auto.get(), mini=self.mini_on)
+        if self.mini:
+            self.cfg["mini_pos"] = [self.mini.winfo_x(), self.mini.winfo_y()]
         save_json(CONFIG_FILE, self.cfg)
         self.root.destroy()
 
@@ -1510,6 +1538,110 @@ class App:
         total = v - self.start_mesos
         self.meso_lbl.config(text=f"Mesos: {v:,}    Session profit: {total:+,}",
                              foreground="green" if total >= 0 else "red")
+        self.update_mini_mesos()
+
+    # ---- mini mode: a small bar over the game for one-screen players
+    def mini_alpha(self):
+        return self.cfg.get("mini_alpha", 0.92)
+
+    def build_mini(self):
+        m = tk.Toplevel(self.root)
+        m.overrideredirect(True)
+        m.attributes("-topmost", True)
+        m.attributes("-alpha", self.mini_alpha())
+        m.configure(bg="#1f1f24")
+        top = tk.Frame(m, bg="#1f1f24")
+        top.pack(fill="x")
+        grip = tk.Label(top, text=" ⠿ ", bg="#1f1f24", fg="#888", cursor="fleur", font=("Segoe UI", 11))
+        grip.pack(side="left")
+        btn = dict(bg="#33333b", fg="#fff", bd=0, activebackground="#4a4a55", activeforeground="#fff",
+                   font=("Segoe UI", 10, "bold"), padx=8, cursor="hand2")
+        tk.Button(top, text="✕", command=self.on_close, **btn).pack(side="right", padx=(2, 4), pady=3)
+        tk.Button(top, text="⤢", command=self.toggle_mini, **btn).pack(side="right", padx=2, pady=3)
+        tk.Button(top, text="🔍 Scan", command=self.scan, **btn).pack(side="right", padx=2, pady=3)
+        self.mini_mesos = tk.Label(top, text="Mesos: -", bg="#1f1f24", fg="#ddd", font=("Segoe UI", 10, "bold"))
+        self.mini_mesos.pack(side="left", padx=4)
+        self.mini_deal = tk.Label(m, text=self.banner.cget("text"), bg=self.banner.cget("bg"),
+                                  fg=self.banner.cget("fg"), font=("Segoe UI", 12, "bold"),
+                                  wraplength=400, justify="left", anchor="w", padx=8, pady=5)
+        self.mini_deal.pack(fill="x")
+        self.mini_status = tk.Label(m, text=self.status.cget("text"), bg="#1f1f24", fg="#9ab",
+                                    font=("Segoe UI", 8), anchor="w", padx=6)
+        self.mini_status.pack(fill="x", pady=(1, 3))
+        self.mini_sell = tk.Label(m, text="", bg="#1f1f24", fg="#ffb35c", font=("Segoe UI", 9, "bold"),
+                                  anchor="w", padx=6, wraplength=400, justify="left")
+
+        def press(e):
+            m._drag = (e.x_root - m.winfo_x(), e.y_root - m.winfo_y())
+
+        def drag(e):
+            dx, dy = m._drag
+            m.geometry(f"+{e.x_root - dx}+{e.y_root - dy}")
+
+        def menu(e):
+            mm = tk.Menu(m, tearoff=0)
+            mm.add_command(label="Full window (F9)", command=self.toggle_mini)
+            mm.add_command(label="Scan (F8)", command=self.scan)
+            mm.add_checkbutton(label="Auto-detect shops", variable=self.auto)
+            mm.add_checkbutton(label="Beep", variable=self.beep)
+            mm.add_checkbutton(label="Marks on the shop", variable=self.show_marks,
+                               command=lambda: self.show_marks.get() or self.hide_marks())
+            op = tk.Menu(mm, tearoff=0)
+            for a in (1.0, 0.92, 0.8, 0.65, 0.5):
+                op.add_command(label=f"{int(a * 100)}%", command=lambda a=a: self.set_mini_alpha(a))
+            mm.add_cascade(label="See-through", menu=op)
+            mm.add_command(label="Clear list", command=self.clear)
+            mm.add_separator()
+            mm.add_command(label="Quit", command=self.on_close)
+            mm.tk_popup(e.x_root, e.y_root)
+
+        for w in (m, grip, top, self.mini_mesos, self.mini_deal, self.mini_status, self.mini_sell):
+            w.bind("<Button-1>", press)
+            w.bind("<B1-Motion>", drag)
+            w.bind("<Double-1>", lambda e: self.toggle_mini())
+            w.bind("<Button-3>", menu)
+        pos = self.cfg.get("mini_pos")
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        if not pos or not (0 <= pos[0] < sw - 40 and 0 <= pos[1] < sh - 20):
+            pos = [sw // 2 - 210, 4]  # top middle: above the game's own windows
+        m.geometry(f"+{pos[0]}+{pos[1]}")
+        m.minsize(420, 1)
+        self.mini = m
+        self.update_mini_mesos()
+
+    def set_mini_alpha(self, a):
+        self.cfg["mini_alpha"] = a
+        if self.mini:
+            self.mini.attributes("-alpha", a)
+
+    def update_mini_mesos(self):
+        if not self.mini:
+            return
+        if self.mesos is None:
+            self.mini_mesos.config(text="Mesos: -", fg="#ddd")
+        else:
+            total = self.mesos - self.start_mesos
+            self.mini_mesos.config(text=f"{self.mesos:,}   {total:+,}", fg="#5ee07a" if total >= 0 else "#ff6b6b")
+        todo = ", ".join(b[0] for b in self.bought)
+        if todo:
+            self.mini_sell.config(text=f"➜ Sell to NPC: {todo}")
+            self.mini_sell.pack(fill="x", pady=(0, 3))
+        else:
+            self.mini_sell.pack_forget()
+
+    def toggle_mini(self):
+        if not self.mini:
+            self.build_mini()
+        self.mini_on = not self.mini_on
+        if self.mini_on:
+            self.root.withdraw()
+            self.mini.deiconify()
+            self.mini.lift()
+        else:
+            self.mini.withdraw()
+            self.root.deiconify()
+            self.root.lift()
+        self.cfg["mini"] = self.mini_on
 
     def run(self):
         self.root.mainloop()
