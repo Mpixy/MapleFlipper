@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.31"
+VERSION = "0.32"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -336,11 +336,23 @@ def find_shop_button(img):
     return None
 
 
-def seller_sig(img, btn):
-    """Pixels of the seller's name tag (left of the buttons): changes when it's another shop."""
+def seller_name(img, btn):
+    """Read the seller's name tag under the avatar (left of the buttons)."""
     x, y = int(btn[0]), int(btn[1])
-    tag = img[max(y + 60, 0):y + 95, max(x - 300, 0):max(x - 60, 0)]
-    return hash(tag.tobytes()) if tag.size else None
+    tag = img[max(y + 62, 0):y + 95, max(x - 330, 0):max(x - 110, 0)]
+    if not tag.size:
+        return ""
+    if _ocr is None:
+        ocr(np.zeros((32, 32, 3), np.uint8))  # load the reader
+    return read_line(np.ascontiguousarray(tag))
+
+
+def changed(a, b, limit=0.01):
+    """True if more than `limit` of the pixels differ. The game's animated hand cursor
+    alone changes ~0.5%, so it doesn't count as the list changing."""
+    if a is None or b is None or a.shape != b.shape:
+        return True
+    return np.count_nonzero(np.any(a != b, axis=2)) > limit * a.shape[0] * a.shape[1]
 
 
 def find_shop_items(lines):
@@ -496,7 +508,9 @@ THE APP LEARNS
   real NPC price. It remembers forever.
 
 Green frames are drawn right on the game's shop rows with the profit
-(turn off with 'Marks'). A new shop starts a fresh list automatically.
+(turn off with 'Marks'). Every page of the shop you are in stays in the
+list. When you move on, profitable items stay (Shop column shows '← seller')
+until you buy them; the rest is dropped.
 
 Orange '(?)' = no price known for that item.
 Double-click any row to look the item up on MeowDB.
@@ -530,6 +544,8 @@ class App:
         self.prices = load_prices()
         self.names = sorted(set(self.prices) | set(self.learned.prices))
         self.seen = {}
+        self.seen_shop = {}  # item key -> seller name
+        self.cur_shop = ""
         self.tracking = False
         self.mesos = self.start_mesos = None
         self.busy = self.updating = False
@@ -592,10 +608,10 @@ class App:
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
 
-        cols = ("item", "qty", "price", "npc", "profit")
+        cols = ("item", "qty", "price", "npc", "profit", "shop")
         self.tree = ttk.Treeview(r, columns=cols, show="headings", height=14)
-        for c, w, t in zip(cols, (210, 45, 90, 90, 90),
-                           ("Item", "Qty", "Shop price", "NPC pays", "Profit")):
+        for c, w, t in zip(cols, (200, 40, 80, 80, 80, 90),
+                           ("Item", "Qty", "Shop price", "NPC pays", "Profit", "Shop")):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="w" if c == "item" else "e")
         self.tree.tag_configure("good", background="#b8f5b0")
@@ -716,17 +732,15 @@ class App:
                     if any(abs(btn[0] - t[0]) < 40 and abs(btn[1] - t[1]) < 40 for t in tried):
                         continue  # already looked here (NPC shop / not a shop)
                     tried.append(btn)
-                    sig = seller_sig(screen, btn)
-                    same_shop = self.shop_btn and abs(btn[0] - self.shop_btn[0]) < 40 \
-                        and abs(btn[1] - self.shop_btn[1]) < 40 and sig == self.shop_sig \
-                        and time.time() - self.shop_seen < 15
+                    sig = seller_name(screen, btn)
+                    same_shop = sig == self.shop_sig and time.time() - self.shop_seen < 60
                     self.shop_btn, self.shop_sig = btn, sig
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     cand = {"left": max(x - 400, mon["left"]), "top": max(y + 40, mon["top"]),
                             "width": 560, "height": 600}
-                    if self.cfg.get("auto_clear", True) and not same_shop:
-                        self.root.after(0, self.clear)  # new shop: start a fresh list
-                    self.say("Shop detected - reading it...")
+                    if not same_shop:
+                        self.root.after(0, self.new_shop, sig)
+                    self.say(f"Shop of {sig or '?'} - reading it...")
                     self.root.after(0, self.scan, True, cand)
                     last = None
                     continue
@@ -735,16 +749,15 @@ class App:
                 img = grab(box)
             except Exception:
                 continue
-            same = lambda x, y: x is not None and y is not None and x.shape == y.shape and np.array_equal(x, y)
             # the list stopped moving and shows something we haven't read yet -> scan it
-            if same(img, last) and not same(img, self.scanned):
+            if not changed(img, last, 0.01) and changed(img, self.scanned, 0.02):
                 screen = grab()
                 btn = find_shop_button(screen[:, :, ::-1])
                 if not btn:
                     last = img
                     continue  # buttons hidden for a moment (mouse hover): try again
                 if (abs(btn[0] - self.shop_btn[0]) > 40 or abs(btn[1] - self.shop_btn[1]) > 40
-                        or seller_sig(screen, btn) != self.shop_sig):
+                        or seller_name(screen, btn) != self.shop_sig):
                     # another shop: forget this one so it is detected (and cleared) as new
                     self.shop_box, self.shop_btn, self.shop_sig, last, tried = None, None, None, None, None
                     self.root.after(0, self.hide_marks)
@@ -884,11 +897,15 @@ class App:
                 for i, (name, qty, price) in enumerate(items):
                     real, score = match_name(name, self.names, self.learned)
                     key = (real or name, price)
+                    if not real:  # unknown item: a one-letter misread of a row we already have
+                        key = next((k for k in self.seen if k[1] == price and not self.seen[k][0]
+                                    and Levenshtein.distance(norm(k[0]), norm(name)) <= 2), key)
                     v = (real, name, qty, price)
                     p = self.profit(v)
                     if key not in self.seen and p is not None and p > 0 and p >= self.min_p():
                         new_good = True
                     self.seen[key] = v
+                    self.seen_shop[key] = self.cur_shop
                     if rects and p is not None and p > 0 and p >= self.min_p():
                         marks.append((rects[i], p))
                 if mark_box and mark_box is self.shop_box:
@@ -928,11 +945,14 @@ class App:
             p = self.profit(v)
             if self.only_profit.get() and (p is None or p <= 0 or p < self.min_p()):
                 continue
+            shop = self.seen_shop.get((real or raw, price), "")
+            if shop and shop != self.cur_shop:
+                shop = "← " + shop  # from a shop you already left
             if p is None:
-                vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-"), "unknown"
+                vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
             else:
                 mark = " ✓" if real in self.learned.prices else ""
-                vals = (real, qty, f"{price:,}", f"{self.npc_pays(real, qty):,}{mark}", f"{p:+,}")
+                vals = (real, qty, f"{price:,}", f"{self.npc_pays(real, qty):,}{mark}", f"{p:+,}", shop)
                 tag = "good" if p > 0 and p >= self.min_p() else "bad"
             self.tree.insert("", "end", iid=f"{raw}|{price}", values=vals, tags=(tag,))
 
@@ -1032,6 +1052,8 @@ class App:
             for v in self.seen.values():
                 real, raw, qty, price = v
                 if real and price == spent:
+                    self.seen.pop((real, price), None)
+                    self.root.after(0, self.refresh)
                     self.bought.append([real, raw, qty, self.npc_pays(real, qty), spent])
                     self.save_stats()
                     self.say(f"Bought '{real}' for {spent:,}. Sell it to an NPC - I'll check the price.")
@@ -1145,7 +1167,10 @@ class App:
             ov.overrideredirect(True)
             ov.attributes("-topmost", True)
             ov.configure(bg="#ff00ff")
-            ov.attributes("-transparentcolor", "#ff00ff")
+            try:
+                ov.attributes("-transparentcolor", "#ff00ff")  # Windows: magenta = see-through
+            except tk.TclError:
+                ov.attributes("-alpha", 0.6)
             self.ov_canvas = tk.Canvas(ov, bg="#ff00ff", highlightthickness=0)
             self.ov_canvas.pack(fill="both", expand=True)
             ov.update_idletasks()
@@ -1188,6 +1213,16 @@ class App:
                         auto=self.auto.get())
         save_json(CONFIG_FILE, self.cfg)
         self.root.destroy()
+
+    def new_shop(self, seller):
+        """Another shop: drop the losers of the previous ones, keep the profitable items
+        until they are bought."""
+        for key, v in list(self.seen.items()):
+            p = self.profit(v)
+            if p is None or p <= 0 or p < self.min_p():
+                del self.seen[key]
+        self.cur_shop = seller
+        self.refresh()
 
     def clear(self):
         self.seen.clear()

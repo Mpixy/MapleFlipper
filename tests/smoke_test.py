@@ -41,6 +41,10 @@ class FakeMss:
 
 def fake_grab(region=None):
     img = current["img"]
+    if current.get("cursor"):  # the game's hand cursor animates: changing pixels over the list
+        img = img.copy()
+        x, y = current["cursor"]
+        img[y:y + 32, x:x + 32] = np.random.randint(0, 255, 3)
     if region:
         img = img[region["top"]:region["top"] + region["height"],
                   region["left"]:region["left"] + region["width"]]
@@ -50,10 +54,12 @@ def fake_grab(region=None):
 mf.mss.mss = FakeMss
 mf.grab = fake_grab
 mf.App.overlaps_me = lambda self, box: False
+mf.App.update_db = lambda self: None  # use the test prices, no download
+mf.App.check_update = lambda self: None
 
 app = mf.App()
 app.cfg["seen_help"] = True
-app.prices = {"Iron Ore": 20, "Octopus Leg": 12}
+app.prices = {"Iron Ore": 20, "Octopus Leg": 12, "Silver Earrings": 50000}  # earrings: +10,001
 app.names = sorted(app.prices)
 fails = []
 
@@ -81,6 +87,7 @@ def expected(img):
 
 def close_enough(got, want):
     """Same items, allowing a letter or two of OCR difference per name."""
+    got = got - {"silverearrings"} if "silverearrings" not in want else got  # kept profitable item
     if len(got) != len(want):
         return False
     return all(any(mf.Levenshtein.distance(g, w) <= 2 for w in want) for g in got)
@@ -91,13 +98,32 @@ def script():
     want = [expected(img) for img in screens]
     for i, img in enumerate(screens):
         current["img"] = img
+        btn = mf.find_shop_button(img[:, :, ::-1])
+        # park an animated cursor on the shop list (like the mouse resting there)
+        current["cursor"] = (int(btn[0]) - 200, int(btn[1]) + 250) if i else None
         ok = wait_for(lambda: close_enough({mf.norm(n) for n in raw_names()}, want[i]), 15,
                       f"screen {i + 1}: list shows exactly this shop")
         if not ok:
             print("    got ", sorted(mf.norm(n) for n in raw_names()))
             print("    want", sorted(want[i]))
+    # the profitable earrings from shop 1 must still be listed after visiting other shops
+    keys = [k for k, v in app.seen.items() if v[0] == "Silver Earrings"]
+    if keys and app.seen_shop.get(keys[0]):
+        print(f"OK  profitable item kept from shop '{app.seen_shop[keys[0]]}'")
+    else:
+        fails.append("profitable item kept")
+        print("FAIL profitable item kept", app.seen_shop)
+    # buying it (mesos drop by its price) removes it from the list
+    app.root.after(0, app.on_mesos, 500000)
+    time.sleep(0.3)
+    app.root.after(0, app.on_mesos, 500000 - 39999)
+    wait_for(lambda: not any(v[0] == "Silver Earrings" for v in app.seen.values()), 5,
+             "bought item leaves the list and goes to 'to sell'")
+    print("   ", app.tosell_lbl.cget("text"))
+    app.bought.clear()
+    app.mesos = None
     # a flip: buy Octopus Leg (shop 1 sells it for 30), sell it to an NPC for 12
-    current["img"] = screens[0]
+    current["img"], current["cursor"] = screens[0], None
     wait_for(lambda: any(v[0] == "Octopus Leg" for v in app.seen.values()), 15, "back on shop 1")
     for m in (100000, 100000 - 30, 100000 - 30 + 12):
         app.root.after(0, app.on_mesos, m)
