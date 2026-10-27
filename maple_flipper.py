@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.33"
+VERSION = "0.34"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -280,6 +280,18 @@ def shop_rows(lines):
             nm = max(above, key=lambda o: o["y"])
             rows.append([(int(r["x"]) - 4, int(r["y"] - r["h"] / 2) - 3, int(r["h"]) + 6, r["text"])
                          for r in (nm, ln)])
+    # rows are evenly spaced: put back rows that were hidden (cursor, tooltip) during this read
+    rows.sort(key=lambda r: r[1][1])
+    if len(rows) >= 2:
+        pitch = float(np.median([b[1][1] - a[1][1] for a, b in zip(rows, rows[1:])]))
+        filled = [rows[0]]
+        for row in rows[1:]:
+            gap = round((row[1][1] - filled[-1][1][1]) / pitch) if pitch > 10 else 1
+            for k in range(1, gap):
+                prev = filled[-1]
+                filled.append([(x, y + int(pitch), h, None) for x, y, h, _ in prev])
+            filled.append(row)
+        rows = filled
     return rows
 
 
@@ -292,7 +304,7 @@ def read_rows(img, rows, width=320, seed=False):
             return []
         crops = [np.ascontiguousarray(img[y:y + h, x:x + width])
                  for x, y, h in ((px, py, ph), (nx, ny, nh))]
-        if seed:
+        if seed and ptext is not None:
             _rec_cache[hash(crops[0].tobytes())] = ptext
             _rec_cache[hash(crops[1].tobytes())] = ntext
         m = PRICE_LINE.search(read_line(crops[0]))
@@ -544,6 +556,7 @@ class App:
         self.shop_box = None
         self.scanned = None
         self.rows = []
+        self.incomplete = False
         self.shop_btn = None
         self.shop_sig = None
         self.shop_seen = 0.0
@@ -757,7 +770,7 @@ class App:
             except Exception:
                 continue
             # the list stopped moving and shows something we haven't read yet -> scan it
-            if not changed(img, last, 0.01) and changed(img, self.scanned, 0.02):
+            if not changed(img, last, 0.01) and changed(img, self.scanned, 0 if self.incomplete else 0.02):
                 screen = grab()
                 btn = find_shop_button(screen[:, :, ::-1])
                 if not btn:
@@ -878,8 +891,9 @@ class App:
                     x0 = min(o["x"] for o in prices_l) + img_origin["left"]
                     y0 = min(o["y"] for o in prices_l) + img_origin["top"]
                     y1 = max(o["y"] for o in prices_l) + img_origin["top"]
-                    nb = {"left": int(max(x0 - 120, full["left"])), "top": int(max(y0 - 55, full["top"])),
-                          "width": 470, "height": int(y1 - y0 + 75)}
+                    # only the text columns: the map behind/next to the window keeps moving
+                    nb = {"left": int(max(x0 - 12, full["left"])), "top": int(max(y0 - 55, full["top"])),
+                          "width": 340, "height": int(y1 - y0 + 75)}
                     # reuse this scan for the list area: row positions + text, no second scan
                     dx, dy = img_origin["left"] - nb["left"], img_origin["top"] - nb["top"]
                     sx, sy = -dx, -dy
@@ -900,31 +914,10 @@ class App:
                     mark_box = nb
                 elif box and not items and not auto:
                     self.shop_box = None
-                new_good, marks = False, []
-                for i, (name, qty, price) in enumerate(items):
-                    real, score = match_name(name, self.names, self.learned)
-                    key = (real or name, price)
-                    if not real:  # unknown item: a one-letter misread of a row we already have
-                        key = next((k for k in self.seen if k[1] == price and not self.seen[k][0]
-                                    and Levenshtein.distance(norm(k[0]), norm(name)) <= 2), key)
-                    v = (real, name, qty, price)
-                    p = self.profit(v)
-                    if key not in self.seen and p is not None and p > 0 and p >= self.min_p():
-                        new_good = True
-                    self.seen[key] = v
-                    self.seen_shop[key] = self.cur_shop
-                    if rects and p is not None and p > 0 and p >= self.min_p():
-                        marks.append((rects[i], p))
-                if mark_box and mark_box is self.shop_box:
-                    self.root.after(0, self.draw_marks, mark_box, marks)
-                if new_good and self.beep.get():
-                    import winsound
-                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                self.root.after(0, self.refresh)
-                n_good = sum(1 for v in self.seen.values() if self.profit(v) and self.profit(v) > 0)
-                if items or not auto:
-                    self.say(("Page changed - " if auto else "") + f"Scan took {time.time() - t:.1f}s. Found {len(items)} items. "
-                             f"Profitable so far: {n_good}.")
+                # a row hidden (mouse cursor, tooltip): re-read as soon as anything moves
+                self.incomplete = bool(self.rows) and len(items) < len(self.rows)
+                # the list itself is only touched on the window's thread (no races with it)
+                self.root.after(0, self.apply_scan, items, rects, mark_box, auto, time.time() - t)
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
                 self.say(f"Scan failed: {e}")
@@ -938,6 +931,34 @@ class App:
     def npc_pays(self, item, qty):
         u = self.unit_price(item)
         return None if u is None else npc_value(item, u, qty)
+
+    def apply_scan(self, items, rects, mark_box, auto, took):
+        new_good, marks = False, []
+        for i, (name, qty, price) in enumerate(items):
+            real, score = match_name(name, self.names, self.learned)
+            key = (real or name, price)
+            if not real:  # unknown item: a one-letter misread of a row we already have
+                key = next((k for k in self.seen if k[1] == price and not self.seen[k][0]
+                            and Levenshtein.distance(norm(k[0]), norm(name)) <= 2), key)
+            v = (real, name, qty, price)
+            p = self.profit(v)
+            good = p is not None and p > 0 and p >= self.min_p()
+            if key not in self.seen and good:
+                new_good = True
+            self.seen[key] = v
+            self.seen_shop[key] = self.cur_shop
+            if rects and good:
+                marks.append((rects[i], p))
+        if mark_box and mark_box is self.shop_box:
+            self.draw_marks(mark_box, marks)
+        if new_good and self.beep.get():
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        self.refresh()
+        n_good = sum(1 for v in self.seen.values() if (self.profit(v) or 0) > 0)
+        if items or not auto:
+            self.say(("Page changed - " if auto else "") + f"Scan took {took:.1f}s. Found {len(items)} items. "
+                     f"Profitable so far: {n_good}.")
 
     def profit(self, v):
         real, _, qty, price = v
@@ -1188,12 +1209,14 @@ class App:
             except Exception:
                 pass
             self.overlay = ov
-        w = box["width"] + 140
-        self.overlay.geometry(f"{w}x{box['height']}+{box['left']}+{box['top']}")
+        pad = 70  # rows start left of the watched text area (item icons)
+        w = box["width"] + pad + 140
+        self.overlay.geometry(f"{w}x{box['height']}+{box['left'] - pad}+{box['top']}")
         self.overlay.deiconify()
         c = self.ov_canvas
         c.delete("all")
         for (x, y, rw, rh), p in marks:
+            x += pad
             c.create_rectangle(x, y, x + rw, y + rh, outline="#00e000", width=3)
             c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"+{p:,}",
                           fill="#00c000", font=("Segoe UI", 11, "bold"))

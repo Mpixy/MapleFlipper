@@ -45,6 +45,10 @@ def fake_grab(region=None):
         img = img.copy()
         x, y = current["cursor"]
         img[y:y + 32, x:x + 32] = np.random.randint(0, 255, 3)
+    if current.get("background"):  # the map behind the shop keeps moving (clouds, players)
+        img = img.copy()
+        x, y, w, h = current["background"]
+        img[y:y + h, x:x + w] = np.random.randint(0, 255, (h, w, 3))
     if region:
         img = img[region["top"]:region["top"] + region["height"],
                   region["left"]:region["left"] + region["width"]]
@@ -101,10 +105,12 @@ def script():
         btn = mf.find_shop_button(img[:, :, ::-1])
         # park an animated cursor on the shop list (like the mouse resting there)
         current["cursor"] = (int(btn[0]) - 200, int(btn[1]) + 250) if i else None
+        threading.Timer(2.0, lambda: current.update(cursor=None)).start()  # mouse moves away
         ok = wait_for(lambda: close_enough({mf.norm(n) for n in raw_names()}, want[i]), 15,
                       f"screen {i + 1}: list shows exactly this shop")
         if not ok:
             print("    got ", sorted(mf.norm(n) for n in raw_names()))
+            print("    seen", list(app.seen.items()))
             print("    want", sorted(want[i]))
     # the profitable earrings from shop 1 must still be listed after visiting other shops
     keys = [k for k, v in app.seen.items() if v[0] == "Silver Earrings"]
