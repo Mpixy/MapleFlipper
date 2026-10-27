@@ -10,6 +10,7 @@ import html as htmllib
 import json
 import os
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -32,6 +33,7 @@ PRICES_FILE = os.path.join(DATA, "prices.json")
 CUSTOM_FILE = os.path.join(DATA, "custom_prices.txt")
 CONFIG_FILE = os.path.join(DATA, "config.json")
 LOG_FILE = os.path.join(DATA, "mesos_log.csv")
+BUNDLED_PRICES = os.path.join(getattr(sys, "_MEIPASS", HERE), "prices.json")
 ITEM_URL = "https://meowdb.com/msclassic/item-db/{}"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"}
@@ -95,9 +97,9 @@ def fetch_item(session, item_id):
     return item_id, "error"
 
 
-def update_prices(progress, max_id=12000):
+def update_prices(progress, max_id=12000, path=PRICES_FILE):
     """Crawl MeowDB item pages by number. Ids are not contiguous, so scan a wide range."""
-    db = load_json(PRICES_FILE, {})
+    db = load_json(path, {})
     session = requests.Session()
     found, misses, stats = 0, 0, {}
     t0 = time.time()
@@ -113,20 +115,22 @@ def update_prices(progress, max_id=12000):
             done = start + 49
             left = (time.time() - t0) / done * (max_id - done)
             progress(f"Downloading prices... {done * 100 // max_id}%  ({done:,}/{max_id:,} checked, "
-                     f"{found:,} items found)  ~{int(left // 60)}:{int(left % 60):02d} left at most")
+                     f"{found:,} items found)  ~{int(left // 60)}:{int(left % 60):02d} left at most", done / max_id)
             if found and misses > 2500:
                 break  # well past the last item
             if found % 500 < 50:
-                save_json(PRICES_FILE, db)
+                save_json(path, db)
     with open(os.path.join(DATA, "update_log.txt"), "w", encoding="utf-8") as f:
         f.write(f"found={found} total={len(db)} misses={stats}\n")
     if db:
-        save_json(PRICES_FILE, db)
+        save_json(path, db)
     return found, len(db)
 
 
 def load_prices():
     db = load_json(PRICES_FILE, {})
+    if len(db) < 500:  # nothing downloaded yet: start from the prices shipped with the app
+        db = {**load_json(BUNDLED_PRICES, {}), **db}
     # custom_prices.txt lines: Item Name = 1800
     if os.path.exists(CUSTOM_FILE):
         with open(CUSTOM_FILE, encoding="utf-8") as f:
@@ -247,6 +251,22 @@ def pick_region(root, callback):
 
 # ---------------------------------------------------------------- app
 
+HELP_TEXT = """FIND PROFITABLE ITEMS
+1. Walk into a player shop in the game.
+2. Press F8 (or the big SCAN button).
+3. Green rows = buy it and sell it to any NPC for profit.
+4. Scroll down in the shop and press F8 again - the list keeps growing.
+5. 'Clear list' before visiting the next shop.
+
+TRACK YOUR MESOS
+1. Open your inventory in the game.
+2. Click 'Set mesos area' and drag a box around the mesos number.
+3. Click 'Start tracking'. Every buy / NPC sale is logged with the profit.
+
+Orange '(?)' = no price known for that item.
+'Update prices' = refresh prices after a game patch."""
+
+
 class App:
     def __init__(self):
         self.root = tk.Tk()
@@ -265,6 +285,12 @@ class App:
         self.start_hotkey()
         if len(self.prices) < 500:  # first run or an incomplete download
             self.root.after(300, self.update_db)
+        else:
+            self.say(f"Ready - {len(self.prices):,} item prices loaded. Open a player shop and press F8.")
+        if not self.cfg.get("seen_help"):
+            self.cfg["seen_help"] = True
+            save_json(CONFIG_FILE, self.cfg)
+            self.root.after(500, self.show_help)
 
     # ---- UI
     def build_ui(self):
@@ -281,6 +307,7 @@ class App:
         ttk.Checkbutton(bar, text="Only profitable", variable=self.only_profit,
                         command=self.refresh).pack(side="left", padx=8)
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
+        ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
 
         cols = ("item", "qty", "price", "npc", "profit")
         self.tree = ttk.Treeview(r, columns=cols, show="headings", height=14)
@@ -305,12 +332,23 @@ class App:
         self.hist = tk.Listbox(box, height=6, font=("Consolas", 10))
         self.hist.pack(fill="x", padx=4, pady=4)
 
-        self.status = ttk.Label(r, text="Ready. Open a player shop and press SCAN.",
-                                relief="sunken", anchor="w")
+        self.status = ttk.Label(r, text="Ready. Open a player shop and press SCAN (or F8).",
+                                relief="sunken", anchor="w", padding=3)
         self.status.pack(fill="x", side="bottom")
+        self.pbar = ttk.Progressbar(r, maximum=1.0)
 
-    def say(self, text):
-        self.root.after(0, lambda: self.status.config(text=text))
+    def say(self, text, pct=None):
+        def ui():
+            self.status.config(text=text)
+            if pct is None:
+                self.pbar.pack_forget()
+            else:
+                self.pbar.pack(fill="x", side="bottom", padx=8, pady=2, before=self.status)
+                self.pbar["value"] = pct
+        self.root.after(0, ui)
+
+    def show_help(self):
+        messagebox.showinfo("How to use MapleFlipper", HELP_TEXT)
 
     def start_hotkey(self):
         """System-wide F8 via RegisterHotKey, which games can't swallow like keyboard hooks."""
@@ -473,4 +511,7 @@ class App:
 
 
 if __name__ == "__main__":
-    App().run()
+    if len(sys.argv) == 3 and sys.argv[1] == "--build-prices":  # used by the release build
+        print(update_prices(lambda t, p=None: print(t, flush=True), path=sys.argv[2]))
+    else:
+        App().run()

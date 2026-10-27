@@ -35,7 +35,7 @@ if not defined PY (
 if "%PY%"=="py" (py -3.12 -m venv "%VENV%") else ("%PY%" -m venv "%VENV%")
 if not exist "%VENV%\Scripts\python.exe" (echo Python install failed. Install Python 3.12 from python.org and run again. & pause & exit /b)
 "%VENV%\Scripts\python.exe" -m pip install --upgrade pip -q
-"%VENV%\Scripts\python.exe" -m pip install -q rapidocr-onnxruntime rapidfuzz mss numpy requests pynput || (echo Package install failed. & pause & exit /b)
+"%VENV%\Scripts\python.exe" -m pip install -q rapidocr-onnxruntime rapidfuzz mss numpy requests || (echo Package install failed. & pause & exit /b)
 echo ok> "%VENV%\ready"
 
 :run

@@ -1,27 +1,19 @@
 MapleFlipper - מוצא אייטמים בחנויות שחקנים שמשתלם למכור ל-NPC
 
-הפעלה (בכל מחשב):
- 1. מעתיקים את כל התיקייה (USB / Google Drive).
- 2. לחיצה כפולה על START.bat
-    - בפעם הראשונה הוא מתקין לבד את מה שצריך (כמה דקות) ומוריד מחירים מ-MeowDB.
-    - מהפעם השנייה זה נפתח מייד.
+הפעלה:
+ 1. קליק ימני על MapleFlipper-Windows.zip -> Extract All
+ 2. לחיצה כפולה על MapleFlipper.exe
+ (לא צריך Python ולא שום התקנה. אם Windows מציג "Windows protected your PC" -> More info -> Run anyway)
 
 שימוש:
- - נכנסים לחנות של שחקן -> לוחצים SCAN SHOP (או F8).
- - ירוק = רווח. העמודה Profit = כמה תרוויח על כל קנייה.
- - גוללים בחנות ולוחצים שוב - הרשימה מצטברת. Clear list לחנות חדשה.
- - כתום עם (?) = לא נמצא מחיר. אפשר להוסיף ידנית ב-%LOCALAPPDATA%\MapleFlipper\custom_prices.txt
+ - נכנסים לחנות של שחקן -> F8 (או הכפתור הגדול SCAN SHOP).
+ - ירוק = קונים וסוחרים ל-NPC ברווח. Profit = הרווח.
+ - גוללים בחנות ו-F8 שוב - הרשימה מצטברת. Clear list לפני חנות חדשה.
+ - כתום (?) = אין מחיר לאייטם.
 
 טרקר מזו:
- - פותחים אינבנטורי -> "Set mesos area" -> גוררים ריבוע סביב מספר המזו.
- - "Start tracking" -> כל שינוי נרשם (+ מכירה, - קנייה) + רווח כולל לסשן.
- - היסטוריה נשמרת ב-%LOCALAPPDATA%\MapleFlipper\mesos_log.csv
+ - פותחים אינבנטורי -> Set mesos area -> גוררים ריבוע סביב מספר המזו -> Start tracking.
 
-אם F8 לא עובד כשהמשחק בפוקוס - מריצים את START.bat כמנהל (Run as administrator).
-"Update prices" - מוריד מחירים מחדש אחרי עדכון למשחק.
-
-טוקן GitHub (פעם אחת בכל מחשב, כי הריפו פרטי):
- 1. https://github.com/settings/personal-access-tokens/new
- 2. Repository access: Only select repositories -> MapleFlipper
- 3. Permissions -> Contents: Read-only -> Generate token
- 4. מעתיקים ומדביקים בחלון של START.bat כשהוא מבקש.
+How to use (English):
+ Extract the zip, run MapleFlipper.exe. Open a player shop and press F8.
+ Green rows can be bought and sold to an NPC for profit. Click "? Help" in the app for more.

@@ -1,0 +1,65 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"  # weekly price refresh
+  workflow_dispatch:
+    inputs:
+      refresh_prices:
+        description: "Download all prices from MeowDB again"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: pip install rapidocr-onnxruntime rapidfuzz mss numpy requests pyinstaller
+
+      - name: Get prices from the last release
+        if: github.event_name == 'push' || inputs.refresh_prices != true
+        continue-on-error: true
+        run: gh release download latest -p prices.json --clobber
+
+      - name: Download prices from MeowDB
+        shell: bash
+        run: |
+          if [ ! -s prices.json ] || [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.refresh_prices }}" = "true" ]; then
+            python maple_flipper.py --build-prices prices.json
+          fi
+          python -c "import json; print(len(json.load(open('prices.json'))), 'prices')"
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --windowed --name MapleFlipper
+          --collect-all rapidocr_onnxruntime --collect-all onnxruntime
+          --add-data "prices.json;." maple_flipper.py
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Copy-Item README.txt dist/MapleFlipper/
+          Compress-Archive dist/MapleFlipper/* MapleFlipper-Windows.zip
+
+      - name: Publish release
+        shell: bash
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest MapleFlipper-Windows.zip prices.json \
+            --title "MapleFlipper (latest)" \
+            --notes "Download MapleFlipper-Windows.zip, extract, run MapleFlipper.exe. No Python needed."
