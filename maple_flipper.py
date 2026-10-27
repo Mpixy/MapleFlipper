@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.42"
+VERSION = "0.43"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -641,6 +641,9 @@ With 'Auto' on you don't need F8 at all: the app notices when you open
 a player shop and scans it, and rescans when you scroll.
 
 FLIPS
+'Stats' (or click the flips line) shows today / 7 days / all time, your best
+items and the sellers you made the most from. The mini bar shows the profit
+of this session and per hour.
 The tracker shows what you bought and still have to sell, and counts
 your profit per flip (today and all time).
 
@@ -710,6 +713,8 @@ class App:
         self.bought_keys = {}  # item keys you bought (mesos tracker) -> mesos paid
         self.cur_shop = ""
         self.shops = load_json(SHOPS_FILE, {})
+        self.session_t = time.time()
+        self.session_flips = 0  # profit of the flips finished since the app started
         self.revisit = None  # (when, best profit) of the current shop's last visit
         self.tracking = False
         self.mesos = self.start_mesos = None
@@ -788,6 +793,7 @@ class App:
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
         ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
         ttk.Button(bar, text="Shops", command=self.shops_window).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="Stats", command=self.stats_window).pack(side="right", padx=(0, 6))
 
         cols = ("item", "qty", "price", "npc", "profit", "shop")
         self.tree = ttk.Treeview(r, columns=cols, show="headings", height=14)
@@ -816,8 +822,9 @@ class App:
         self.tosell_lbl = ttk.Label(box, foreground="#b35c00", wraplength=520, cursor="hand2")
         self.tosell_lbl.pack(anchor="w", padx=6)
         self.tosell_lbl.bind("<Button-1>", lambda e: self.sell_dialog())
-        self.stats_lbl = ttk.Label(box, foreground="#555")
+        self.stats_lbl = ttk.Label(box, foreground="#555", cursor="hand2")
         self.stats_lbl.pack(anchor="w", padx=6)
+        self.stats_lbl.bind("<Button-1>", lambda e: self.stats_window())
         self.hist = tk.Listbox(box, height=4, font=("Consolas", 10))
         self.hist.pack(fill="x", padx=4, pady=4)
 
@@ -1160,12 +1167,25 @@ class App:
             else:
                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
         self.show_banner()
+        if new_good and best >= max(10000, 10 * self.min_p()):
+            self.flash(6)
         self.refresh()
         n_good = sum(1 for k, v in self.seen.items() if (self.profit(v) or 0) > 0
                      and k not in self.unsure and k not in self.bought_keys)
         if items or not auto:
             self.say(("Page changed - " if auto else "") + f"Scan took {took:.1f}s. Found {len(items)} items. "
                      f"Profitable so far: {n_good}.")
+
+    def flash(self, n):
+        """Blink the banner (big deal found) so you notice it even looking at the game."""
+        bg = self.banner.cget("bg")
+        if n <= 0 or bg not in ("#ffd23f", "#ff3b3b"):
+            return
+        new = "#ff3b3b" if bg == "#ffd23f" else "#ffd23f"
+        self.banner.config(bg=new)
+        if self.mini:
+            self.mini_deal.config(bg=new)
+        self.root.after(250, self.flash, n - 1)
 
     def set_banner(self, text, bg, fg):
         self.banner.config(text=text, bg=bg, fg=fg)
@@ -1342,6 +1362,8 @@ class App:
                 self.seen[key] = v
                 self.seen_shop.setdefault(key, self.cur_shop)
             self.bought_keys[key] = spent
+            if self.seen_shop.get(key):
+                self.stats.setdefault("from", {})[real] = self.seen_shop[key]
             pays = self.npc_pays(real, qty)
             self.bought.append([real, raw, qty, pays, spent])
             self.save_stats()
@@ -1386,9 +1408,49 @@ class App:
         self.root.after(0, self.show_stats)
 
     def record_flip(self, item, paid, got):
+        seller = self.stats.setdefault("from", {}).pop(item, "")
         self.stats["flips"].append({"time": time.strftime("%Y-%m-%d %H:%M"), "item": item,
-                                    "paid": paid, "got": got})
+                                    "paid": paid, "got": got, "shop": seller})
+        self.session_flips += got - paid
         self.save_stats()
+
+    def stats_window(self):
+        """Your flips: today / this week / all time, best items and best sellers."""
+        flips = self.stats["flips"]
+        top = tk.Toplevel(self.root)
+        top.title("Your flips")
+        top.attributes("-topmost", True)
+        nb = ttk.Notebook(top)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        today = time.strftime("%Y-%m-%d")
+        week = time.strftime("%Y-%m-%d", time.localtime(time.time() - 6 * 86400))
+        for title, fs in (("Today", [f for f in flips if f["time"] >= today]),
+                          ("7 days", [f for f in flips if f["time"] >= week]), ("All time", flips)):
+            pg = ttk.Frame(nb)
+            nb.add(pg, text=title)
+            prof = sum(f["got"] - f["paid"] for f in fs)
+            best = max(fs, key=lambda f: f["got"] - f["paid"], default=None)
+            ttk.Label(pg, text=f"{prof:+,} mesos", font=("Segoe UI", 20, "bold"),
+                      foreground="#1a8f3a" if prof >= 0 else "#c01c28").pack(anchor="w", padx=8, pady=(8, 0))
+            line = f"{len(fs)} flips" + (f"   ·   {prof // len(fs):+,} per flip" if fs else "")
+            if best:
+                line += f"\nBest: {best['item']} {best['got'] - best['paid']:+,}  ({best['time']})"
+            ttk.Label(pg, text=line, foreground="#555").pack(anchor="w", padx=8)
+            for what, col, key in (("Best items", "Item", "item"), ("Best sellers", "Seller", "shop")):
+                sums = {}
+                for f in fs:
+                    if f.get(key):
+                        n, p = sums.get(f[key], (0, 0))
+                        sums[f[key]] = (n + 1, p + f["got"] - f["paid"])
+                ttk.Label(pg, text=what, font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8, pady=(10, 2))
+                tv = ttk.Treeview(pg, columns=("n", "x", "p"), show="headings", height=6)
+                for c, t, w in (("n", col, 170), ("x", "Flips", 60), ("p", "Profit", 90)):
+                    tv.heading(c, text=t)
+                    tv.column(c, width=w, anchor="w" if c == "n" else "e")
+                for name, (n, p) in sorted(sums.items(), key=lambda kv: -kv[1][1])[:10]:
+                    tv.insert("", "end", values=(name, n, f"{p:+,}"))
+                tv.pack(fill="x", padx=8)
+        ttk.Button(top, text="Close", command=top.destroy).pack(pady=(0, 8))
 
     def show_stats(self):
         today = time.strftime("%Y-%m-%d")
@@ -1396,7 +1458,7 @@ class App:
         t = [f for f in flips if f["time"].startswith(today)]
         prof = lambda fs: sum(f["got"] - f["paid"] for f in fs)
         self.stats_lbl.config(text=f"Flips today: {len(t)}  profit {prof(t):+,}    "
-                                   f"All time: {len(flips)}  profit {prof(flips):+,}")
+                                   f"All time: {len(flips)}  profit {prof(flips):+,}    (click for stats)")
         if self.bought:
             todo = ", ".join(f"{b[0]} (+{b[3] - b[4]:,})" if b[3] is not None else b[0]
                              for b in self.bought)
@@ -1774,6 +1836,8 @@ class App:
         tk.Button(top, text="🔍 Scan", command=self.scan, **btn).pack(side="right", padx=2, pady=3)
         self.mini_mesos = tk.Label(top, text="Mesos: -", bg="#1f1f24", fg="#ddd", font=("Segoe UI", 10, "bold"))
         self.mini_mesos.pack(side="left", padx=4)
+        self.mini_flips = tk.Label(top, text="", bg="#1f1f24", fg="#5ee07a", font=("Segoe UI", 10, "bold"))
+        self.mini_flips.pack(side="left", padx=4)
         self.mini_deal = tk.Label(m, text=self.banner.cget("text"), bg=self.banner.cget("bg"),
                                   fg=self.banner.cget("fg"), font=("Segoe UI", 12, "bold"),
                                   wraplength=400, justify="left", anchor="w", padx=8, pady=5)
@@ -1806,11 +1870,12 @@ class App:
             mm.add_command(label="Clear list", command=self.clear)
             mm.add_command(label="Mark items as sold...", command=self.sell_dialog)
             mm.add_command(label="Shops you checked...", command=self.shops_window)
+            mm.add_command(label="Your flips (stats)...", command=self.stats_window)
             mm.add_separator()
             mm.add_command(label="Quit", command=self.on_close)
             mm.tk_popup(e.x_root, e.y_root)
 
-        for w in (m, grip, top, self.mini_mesos, self.mini_deal, self.mini_status, self.mini_sell):
+        for w in (m, grip, top, self.mini_mesos, self.mini_flips, self.mini_deal, self.mini_status, self.mini_sell):
             w.bind("<Button-1>", press)
             w.bind("<B1-Motion>", drag)
             w.bind("<Double-1>", lambda e: self.toggle_mini())
@@ -1839,8 +1904,11 @@ class App:
         if self.mesos is None:
             self.mini_mesos.config(text="Mesos: -", fg="#ddd")
         else:
-            total = self.mesos - self.start_mesos
-            self.mini_mesos.config(text=f"{self.mesos:,}   {total:+,}", fg="#5ee07a" if total >= 0 else "#ff6b6b")
+            self.mini_mesos.config(text=f"{self.mesos:,}", fg="#ddd")
+        hours = max((time.time() - self.session_t) / 3600, 0.25)  # no silly numbers in the first minutes
+        p = self.session_flips
+        self.mini_flips.config(text=f"flips {p:+,}  ({round(p / hours):+,}/h)" if p else "",
+                               fg="#5ee07a" if p >= 0 else "#ff6b6b")
         names = [b[0] for b in self.bought]
         if names:
             todo = ", ".join(names[:3]) + (f" +{len(names) - 3} more" if len(names) > 3 else "")
