@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.43"
+VERSION = "0.44"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -670,6 +670,13 @@ SHOPS YOU ALREADY CHECKED
 Walk into a shop you checked in the last 12 hours and the app tells you
 when, and what the best deal was ('Shops' button for the full list).
 
+WATCH LIST
+'👀 Watch' (or right-click a row): items you always want to hear about.
+Purple frame + sound when one is in a shop, profitable or not.
+
+KEYS: F8 scan · F9 mini/full window · F10 clear the list
+'⟳ Restart' if the app ever gets stuck - nothing is lost.
+
 Orange '(?)' = no price known for that item.
 Double-click any row to look the item up on MeowDB.
 Min profit = only highlight items that earn at least this much.
@@ -714,6 +721,9 @@ class App:
         self.cur_shop = ""
         self.shops = load_json(SHOPS_FILE, {})
         self.session_t = time.time()
+        self.count = {}  # item key -> how many identical rows the shop page has (Lemona ×2)
+        self.watch = self.cfg.get("watch", [])  # item names (or parts) to always tell you about
+        self.watch_seen = set()
         self.session_flips = 0  # profit of the flips finished since the app started
         self.revisit = None  # (when, best profit) of the current shop's last visit
         self.tracking = False
@@ -773,7 +783,7 @@ class App:
 
         bar = ttk.Frame(r)
         bar.pack(fill="x", padx=8)
-        ttk.Button(bar, text="Clear list", command=self.clear).pack(side="left")
+        ttk.Button(bar, text="Clear (F10)", command=self.clear).pack(side="left")
         self.only_profit = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="Only profitable", variable=self.only_profit,
                         command=self.refresh).pack(side="left", padx=8)
@@ -794,6 +804,8 @@ class App:
         ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
         ttk.Button(bar, text="Shops", command=self.shops_window).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="Stats", command=self.stats_window).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="👀 Watch", command=self.watch_dialog).pack(side="right", padx=(0, 6))
+        ttk.Button(top, text="⟳ Restart", command=self.restart).pack(side="right")
 
         cols = ("item", "qty", "price", "npc", "profit", "shop")
         self.tree = ttk.Treeview(r, columns=cols, show="headings", height=14)
@@ -805,6 +817,7 @@ class App:
         self.tree.tag_configure("bad", foreground="#999")
         self.tree.tag_configure("unknown", foreground="#c07000")
         self.tree.tag_configure("unsure", background="#ffe7a8")
+        self.tree.tag_configure("watch", background="#e7d4f7")
         self.tree.tag_configure("bought", background="#9cc8ff", font=("Segoe UI", 9, "bold"))
         self.tree.pack(fill="both", expand=True, padx=8, pady=6)
         self.tree.bind("<Double-1>", self.open_item)
@@ -962,7 +975,7 @@ class App:
         """Poll the real key state: works even when the game swallows the key press."""
         def loop():
             user32 = ctypes.windll.user32
-            was_down = was9 = False
+            was_down = was9 = was10 = False
             while True:
                 down = bool(user32.GetAsyncKeyState(0x77) & 0x8000)  # VK_F8
                 if down and not was_down:
@@ -972,6 +985,11 @@ class App:
                 if d9 and not was9:
                     self.root.after(0, self.toggle_mini)
                 was9 = d9
+                d10 = bool(user32.GetAsyncKeyState(0x79) & 0x8000)  # VK_F10: clear the list
+                if d10 and not was10:
+                    self.root.after(0, self.clear)
+                    self.say("List cleared (F10).")
+                was10 = d10
                 time.sleep(0.03)
         threading.Thread(target=loop, daemon=True).start()
 
@@ -1134,7 +1152,7 @@ class App:
         return None if u is None else npc_value(item, u, qty)
 
     def apply_scan(self, items, rects, mark_box, auto, took):
-        new_good, marks = False, []
+        new_good, new_watch, marks, page = False, [], [], {}
         for i, (name, qty, price, sure) in enumerate(items):
             real, score = match_name(name, self.names, self.learned)
             key = (real or name, price)
@@ -1152,14 +1170,28 @@ class App:
                 new_good = True
             self.seen[key] = v
             self.seen_shop[key] = self.cur_shop
-            if rects and good:
-                marks.append((rects[i], p))
+            page[key] = page.get(key, 0) + 1
+            watched = self.watched(real or name)
+            if watched and (key, self.cur_shop) not in self.watch_seen:
+                self.watch_seen.add((key, self.cur_shop))
+                new_watch.append(v)
+            if rects and (good or watched):
+                marks.append((rects[i], p if good else None))
+        self.count.update(page)
         if mark_box and mark_box is self.shop_box:
             self.draw_marks(mark_box, marks)
-        best = max(marks, key=lambda m: m[1])[1] if marks else 0
+        profits = [p for _, p in marks if p is not None]
+        best = max(profits, default=0)
         if new_good:
-            self.found_today += sum(p for _, p in marks)
-        if new_good and self.beep.get():
+            self.found_today += sum(profits)
+        if new_watch:
+            v = new_watch[0]
+            self.say(f"👀 WATCHED ITEM: {v[0] or v[1]} for {v[3]:,} at {self.cur_shop or 'this shop'}!")
+            if self.beep.get():
+                import winsound
+                threading.Thread(target=lambda: [winsound.Beep(f, 120) for f in (1000, 750, 1000, 750)],
+                                 daemon=True).start()
+        elif new_good and self.beep.get():
             import winsound
             if best >= max(10000, 10 * self.min_p()):  # jackpot: a little fanfare
                 threading.Thread(target=lambda: [winsound.Beep(f, 90) for f in (660, 880, 1320)],
@@ -1167,8 +1199,8 @@ class App:
             else:
                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
         self.show_banner()
-        if new_good and best >= max(10000, 10 * self.min_p()):
-            self.flash(6)
+        if new_watch or (new_good and best >= max(10000, 10 * self.min_p())):
+            self.flash(8 if new_watch else 6)
         self.refresh()
         n_good = sum(1 for k, v in self.seen.items() if (self.profit(v) or 0) > 0
                      and k not in self.unsure and k not in self.bought_keys)
@@ -1179,9 +1211,10 @@ class App:
     def flash(self, n):
         """Blink the banner (big deal found) so you notice it even looking at the game."""
         bg = self.banner.cget("bg")
-        if n <= 0 or bg not in ("#ffd23f", "#ff3b3b"):
+        cycle = {"#ffd23f": "#ff3b3b", "#ff3b3b": "#ffd23f", "#9b4dca": "#e056fd", "#e056fd": "#9b4dca"}
+        if n <= 0 or bg not in cycle:
             return
-        new = "#ff3b3b" if bg == "#ffd23f" else "#ffd23f"
+        new = cycle[bg]
         self.banner.config(bg=new)
         if self.mini:
             self.mini_deal.config(bg=new)
@@ -1196,18 +1229,72 @@ class App:
         """One big line: what to buy in this shop right now (or: move on)."""
         here = [(self.profit(v), v) for k, v in self.seen.items()
                 if self.seen_shop.get(k) == self.cur_shop and k not in self.unsure and k not in self.bought_keys]
+        watched = [v for k, v in self.seen.items() if self.seen_shop.get(k) == self.cur_shop
+                   and k not in self.bought_keys and self.watched(v[0] or v[1])]
         here = [(p, v) for p, v in here if p is not None and p > 0 and p >= self.min_p()]
+        eye = "   👀 " + ", ".join(f"{v[0] or v[1]} {v[3]:,}" for v in watched[:2]) if watched else ""
         if here:
             p, v = max(here, key=lambda x: x[0])
-            more = f"   (+{len(here) - 1} more, total +{sum(x[0] for x in here):,})" if len(here) > 1 else ""
+            n = self.count.get(real_key(v), 1)
+            total = sum(x[0] * self.count.get(real_key(x[1]), 1) for x in here)
+            rows = sum(self.count.get(real_key(x[1]), 1) for x in here)
+            more = f"   ({rows} to buy, total +{total:,})" if rows > 1 else ""
             hot = p >= max(10000, 10 * self.min_p())
-            self.set_banner(f"{'💰' if hot else '✅'} BUY: {v[0]}  for {v[3]:,}  →  +{p:,}{more}",
+            times = f" ×{n}" if n > 1 else ""
+            self.set_banner(f"{'💰' if hot else '✅'} BUY: {v[0]}{times}  for {v[3]:,}  →  +{p:,}{more}{eye}",
                             "#ffd23f" if hot else "#2fb344", "#000" if hot else "#fff")
+        elif watched:
+            v = watched[0]
+            self.set_banner(f"👀 WATCHED: {v[0] or v[1]}  for {v[3]:,}" + (f"  (+{len(watched) - 1} more)"
+                            if len(watched) > 1 else ""), "#9b4dca", "#fff")
         elif self.cur_shop:
             again = f"  (checked {ago(self.revisit[0])})" if self.revisit else ""
             self.set_banner(f"✖ Nothing at {self.cur_shop}{again} - next shop!", "#e8e8e8", "#777")
         self.shops_lbl.config(text=f"Shops checked this session: {self.shops_today}    "
                                    f"Profit spotted: +{self.found_today:,}")
+
+    def watched(self, name):
+        n = norm(name or "")
+        return bool(n) and any(w and norm(w) in n for w in self.watch)
+
+    def watch_dialog(self):
+        top = tk.Toplevel(self.root)
+        top.title("Watch list")
+        top.attributes("-topmost", True)
+        ttk.Label(top, text="Items to always tell you about (one per line, part of the name is enough).\n"
+                            "Purple frame + sound when one shows up in a shop - even if it isn't profitable.",
+                  foreground="#555").pack(padx=10, pady=(8, 4), anchor="w")
+        txt = tk.Text(top, width=40, height=12, font=("Segoe UI", 10))
+        txt.insert("1.0", "\n".join(self.watch))
+        txt.pack(padx=10, fill="both", expand=True)
+        txt.focus_set()
+
+        def save():
+            self.watch = [w.strip() for w in txt.get("1.0", "end").splitlines() if w.strip()]
+            self.cfg["watch"] = self.watch
+            save_json(CONFIG_FILE, self.cfg)
+            self.watch_seen.clear()
+            top.destroy()
+            self.refresh()
+            self.show_banner()
+            self.say(f"Watching {len(self.watch)} items.")
+        ttk.Button(top, text="Save", command=save).pack(pady=8)
+
+    def watch_item(self, item):
+        if item and item not in self.watch:
+            self.watch.append(item)
+            self.cfg["watch"] = self.watch
+            save_json(CONFIG_FILE, self.cfg)
+            self.refresh()
+            self.say(f"👀 Watching '{item}' from now on.")
+
+    def restart(self):
+        """Stuck or acting weird: start the app again (keeps everything it learned)."""
+        import subprocess
+        self.on_close_save()
+        args = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+        subprocess.Popen(args)
+        os._exit(0)  # don't wait for the background threads
 
     def profit(self, v):
         real, _, qty, price = v
@@ -1223,7 +1310,11 @@ class App:
             key = real_key(v)
             p = self.profit(v)
             bought, unsure = key in self.bought_keys, key in self.unsure
-            if self.only_profit.get() and not bought and not unsure and (p is None or p <= 0 or p < self.min_p()):
+            watched = self.watched(real or raw)
+            n = self.count.get(key, 1)
+            times = f" ×{n}" if n > 1 else ""
+            if (self.only_profit.get() and not bought and not unsure and not watched
+                    and (p is None or p <= 0 or p < self.min_p())):
                 continue
             shop = self.seen_shop.get(key, "")
             if shop and shop != self.cur_shop:
@@ -1241,8 +1332,13 @@ class App:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
             else:
                 mark = " ✓" if real in self.learned.prices else ""
-                vals = (real, qty, f"{price:,}", f"{self.npc_pays(real, qty):,}{mark}", f"{p:+,}", shop)
+                prof = f"{p:+,}" + (f" ×{n}" if n > 1 and p > 0 else "")
+                vals = (real + times, qty, f"{price:,}", f"{self.npc_pays(real, qty):,}{mark}", prof, shop)
                 tag = "good" if p > 0 and p >= self.min_p() else "bad"
+            if watched and tag != "bought":
+                vals = ("👀 " + vals[0],) + vals[1:]
+                if tag != "good":
+                    tag = "watch"
             self.tree.insert("", "end", iid=f"{raw}|{price}", values=vals, tags=(tag,))
 
     # ---- teaching
@@ -1264,6 +1360,7 @@ class App:
         if real:
             m.add_command(label=f"Wrong item - it is NOT '{real}'", command=lambda: self.fix_item(v, wrong=True))
         m.add_command(label="Pick the correct item...", command=lambda: self.fix_item(v))
+        m.add_command(label=f"👀 Watch '{real or raw}'", command=lambda: self.watch_item(real or raw))
         if real:
             m.add_command(label=f"Set real NPC price of '{real}'...", command=lambda: self.ask_price(real))
             if real in self.learned.prices:
@@ -1631,9 +1728,14 @@ class App:
         self.overlay.deiconify()
         c = self.ov_canvas
         c.delete("all")
-        best = max(p for _, p in marks)
+        best = max((p for _, p in marks if p is not None), default=None)
         for (x, y, rw, rh), p in marks:
             x += pad
+            if p is None:  # an item on your watch list
+                c.create_rectangle(x, y, x + rw, y + rh, outline="#b44dff", width=4)
+                c.create_text(x + rw + 6, y + rh / 2, anchor="w", text="👀 WATCH",
+                              fill="#b44dff", font=("Segoe UI", 12, "bold"))
+                continue
             top = p == best and len(marks) > 1
             color = "#ffb000" if top else "#00e000"
             c.create_rectangle(x, y, x + rw, y + rh, outline=color, width=4 if top else 3)
@@ -1657,6 +1759,10 @@ class App:
                             urllib.parse.quote(f"site:meowdb.com/msclassic {name}"))
 
     def on_close(self):
+        self.on_close_save()
+        self.root.destroy()
+
+    def on_close_save(self):
         self.cfg.update(tracking=self.tracking, marks=self.show_marks.get(),
                         geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
                         auto=self.auto.get(), mini=self.mini_on)
@@ -1664,7 +1770,6 @@ class App:
         if self.mini:
             self.cfg["mini_pos"] = [self.mini.winfo_x(), self.mini.winfo_y()]
         save_json(CONFIG_FILE, self.cfg)
-        self.root.destroy()
 
     def new_shop(self, seller):
         """Another shop: drop the losers of the previous ones, keep the profitable items
@@ -1732,6 +1837,9 @@ class App:
                                                             top.destroy())).pack(pady=(0, 8))
 
     def clear(self):
+        self.count.clear()
+        self.watch_seen.clear()
+        self.hide_marks()
         self.seen = {k: v for k, v in self.seen.items() if k in self.bought_keys}
         self.unsure.clear()
         self.refresh()
@@ -1833,6 +1941,7 @@ class App:
                    font=("Segoe UI", 10, "bold"), padx=8, cursor="hand2")
         tk.Button(top, text="✕", command=self.on_close, **btn).pack(side="right", padx=(2, 4), pady=3)
         tk.Button(top, text="⤢", command=self.toggle_mini, **btn).pack(side="right", padx=2, pady=3)
+        tk.Button(top, text="⟳", command=self.restart, **btn).pack(side="right", padx=2, pady=3)
         tk.Button(top, text="🔍 Scan", command=self.scan, **btn).pack(side="right", padx=2, pady=3)
         self.mini_mesos = tk.Label(top, text="Mesos: -", bg="#1f1f24", fg="#ddd", font=("Segoe UI", 10, "bold"))
         self.mini_mesos.pack(side="left", padx=4)
@@ -1867,10 +1976,12 @@ class App:
             for a in (1.0, 0.92, 0.8, 0.65, 0.5):
                 op.add_command(label=f"{int(a * 100)}%", command=lambda a=a: self.set_mini_alpha(a))
             mm.add_cascade(label="See-through", menu=op)
-            mm.add_command(label="Clear list", command=self.clear)
+            mm.add_command(label="Clear list (F10)", command=self.clear)
             mm.add_command(label="Mark items as sold...", command=self.sell_dialog)
             mm.add_command(label="Shops you checked...", command=self.shops_window)
             mm.add_command(label="Your flips (stats)...", command=self.stats_window)
+            mm.add_command(label="👀 Watch list...", command=self.watch_dialog)
+            mm.add_command(label="⟳ Restart the app", command=self.restart)
             mm.add_separator()
             mm.add_command(label="Quit", command=self.on_close)
             mm.tk_popup(e.x_root, e.y_root)
