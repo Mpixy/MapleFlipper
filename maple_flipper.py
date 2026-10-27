@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.34"
+VERSION = "0.35"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -44,6 +44,9 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
                          "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"}
 
 PRICE_LINE = re.compile(r"^\s*(\d[\d,.]*)\s*f[o0]r\s*(\d[\d,.]*)\s*m", re.I)
+
+
+GROUPED = re.compile(r"^\d{1,3}([,.]\d{3})+$|^\d{1,4}$")  # "2,999" / "299": commas every 3 digits
 
 
 def to_int(s):
@@ -295,8 +298,28 @@ def shop_rows(lines):
     return rows
 
 
+def read_price(crop):
+    """Read a 'N for X mesos' line twice: as is and enlarged. OCR sometimes drops a digit
+    ('2,999' -> '299'); the two reads then disagree. Returns (qty, price, sure) or None."""
+    import cv2  # comes with rapidocr
+    reads = []
+    for im in (crop, cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)):
+        m = PRICE_LINE.search(read_line(np.ascontiguousarray(im)))
+        if m and to_int(m.group(1)) and to_int(m.group(2)):
+            raw = m.group(2).strip(",.")
+            reads.append((to_int(m.group(1)), to_int(raw), bool(GROUPED.match(raw))))
+    if not reads:
+        return None
+    if len(reads) == 2 and reads[0][:2] == reads[1][:2]:
+        return reads[0][0], reads[0][1], reads[0][2]
+    # disagree (or only one read): prefer a well-formed number, then the longer one
+    # (a lost digit is far more common than an invented one) - but don't trust it
+    qty, price, _ = max(reads, key=lambda r: (r[2], r[1]))
+    return qty, price, False
+
+
 def read_rows(img, rows, width=320, seed=False):
-    """Read the shop rows at known places. Returns (name, qty, price, row rect) per row.
+    """Read the shop rows at known places. Returns (name, qty, price, row rect, sure) per row.
     seed=True stores the text the full scan already read, so nothing is read twice."""
     items = []
     for (nx, ny, nh, ntext), (px, py, ph, ptext) in rows:
@@ -307,13 +330,13 @@ def read_rows(img, rows, width=320, seed=False):
         if seed and ptext is not None:
             _rec_cache[hash(crops[0].tobytes())] = ptext
             _rec_cache[hash(crops[1].tobytes())] = ntext
-        m = PRICE_LINE.search(read_line(crops[0]))
-        if not m:
+        got = read_price(crops[0])
+        if not got:
             continue  # empty slot / tooltip in the way
         name = read_line(crops[1])
-        qty, cost = to_int(m.group(1)), to_int(m.group(2))
-        if qty and cost and re.search(r"[A-Za-z]{2}", name):
-            items.append((name, qty, cost, (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4))))
+        qty, cost, sure = got
+        if re.search(r"[A-Za-z]{2}", name):
+            items.append((name, qty, cost, (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4)), sure))
     return items
 
 
@@ -384,12 +407,13 @@ def find_shop_items(lines):
         qty, price = to_int(m.group(1)), to_int(m.group(2))
         if not qty or not price:
             continue
+        sure = bool(GROUPED.match(m.group(2).strip(",.")))
         above = [o for o in lines if o is not ln and abs(o["x"] - ln["x"]) < 40
                  and 0 < ln["y"] - o["y"] < 2.5 * max(ln["h"], 12)
                  and not PRICE_LINE.search(o["text"])]
         if above:
             name = max(above, key=lambda o: o["y"])["text"]
-            items.append((name, qty, price))
+            items.append((name, qty, price, sure))
     return items
 
 
@@ -417,6 +441,14 @@ def find_npc_items(lines):
                 qty = int(o["text"])
         items.append((name_ln["text"], qty, price))
     return items
+
+
+def lost_digits(short, full):
+    """True if `short` is `full` with 1-2 digits dropped (how OCR misreads prices)."""
+    if not 1 <= len(full) - len(short) <= 2:
+        return False
+    it = iter(full)
+    return all(c in it for c in short)
 
 
 def norm(s):
@@ -537,6 +569,10 @@ Min profit = only highlight items that earn at least this much.
 'Update prices' = refresh prices after a game patch."""
 
 
+def real_key(v):
+    return (v[0] or v[1], v[3])
+
+
 class App:
     def __init__(self):
         self.root = tk.Tk()
@@ -565,6 +601,8 @@ class App:
         self.names = sorted(set(self.prices) | set(self.learned.prices))
         self.seen = {}
         self.seen_shop = {}  # item key -> seller name
+        self.unsure = set()  # item keys whose price was read differently twice: never 'profitable'
+        self.bought_keys = {}  # item keys you bought (mesos tracker) -> mesos paid
         self.cur_shop = ""
         self.tracking = False
         self.mesos = self.start_mesos = None
@@ -637,6 +675,8 @@ class App:
         self.tree.tag_configure("good", background="#b8f5b0")
         self.tree.tag_configure("bad", foreground="#999")
         self.tree.tag_configure("unknown", foreground="#c07000")
+        self.tree.tag_configure("unsure", background="#ffe7a8")
+        self.tree.tag_configure("bought", background="#9cc8ff", font=("Segoe UI", 9, "bold"))
         self.tree.pack(fill="both", expand=True, padx=8, pady=6)
         self.tree.bind("<Double-1>", self.open_item)
         self.tree.bind("<Button-3>", self.row_menu)
@@ -874,8 +914,8 @@ class App:
                     if box and box is self.shop_box and items:
                         self.rows = shop_rows(lines)
                         items = read_rows(img, self.rows, seed=True) or items
-                rects = [it[3] for it in items if len(it) == 4]
-                items = [it[:3] for it in items]
+                rects = [it[3] for it in items if len(it) == 5]
+                items = [(it[0], it[1], it[2], it[-1]) for it in items]
                 img_origin = origin
                 if not items and (not self.shop_box or not auto):
                     # not a player shop here: read the whole screen (shop moved, or an NPC shop)
@@ -905,7 +945,7 @@ class App:
                         self.rows = shop_rows(shifted)
                         got = read_rows(sub, self.rows, seed=True)
                         if got:
-                            items = [it[:3] for it in got]
+                            items = [(it[0], it[1], it[2], it[4]) for it in got]
                             rects = [it[3] for it in got]
                             self.scanned = sub  # the loop now only rescans when the list changes
                         else:
@@ -934,15 +974,19 @@ class App:
 
     def apply_scan(self, items, rects, mark_box, auto, took):
         new_good, marks = False, []
-        for i, (name, qty, price) in enumerate(items):
+        for i, (name, qty, price, sure) in enumerate(items):
             real, score = match_name(name, self.names, self.learned)
             key = (real or name, price)
             if not real:  # unknown item: a one-letter misread of a row we already have
                 key = next((k for k in self.seen if k[1] == price and not self.seen[k][0]
                             and Levenshtein.distance(norm(k[0]), norm(name)) <= 2), key)
             v = (real, name, qty, price)
+            if sure:
+                self.unsure.discard(key)
+            else:
+                self.unsure.add(key)
             p = self.profit(v)
-            good = p is not None and p > 0 and p >= self.min_p()
+            good = sure and p is not None and p > 0 and p >= self.min_p()
             if key not in self.seen and good:
                 new_good = True
             self.seen[key] = v
@@ -955,7 +999,8 @@ class App:
             import winsound
             winsound.MessageBeep(winsound.MB_ICONASTERISK)
         self.refresh()
-        n_good = sum(1 for v in self.seen.values() if (self.profit(v) or 0) > 0)
+        n_good = sum(1 for k, v in self.seen.items() if (self.profit(v) or 0) > 0
+                     and k not in self.unsure and k not in self.bought_keys)
         if items or not auto:
             self.say(("Page changed - " if auto else "") + f"Scan took {took:.1f}s. Found {len(items)} items. "
                      f"Profitable so far: {n_good}.")
@@ -968,15 +1013,27 @@ class App:
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         rows = sorted(self.seen.values(), key=lambda v: -(self.profit(v) or -1e12))
+        rows.sort(key=lambda v: (real_key(v) not in self.bought_keys))  # bought rows on top
         for v in rows:
             real, raw, qty, price = v
+            key = real_key(v)
             p = self.profit(v)
-            if self.only_profit.get() and (p is None or p <= 0 or p < self.min_p()):
+            bought, unsure = key in self.bought_keys, key in self.unsure
+            if self.only_profit.get() and not bought and not unsure and (p is None or p <= 0 or p < self.min_p()):
                 continue
-            shop = self.seen_shop.get((real or raw, price), "")
+            shop = self.seen_shop.get(key, "")
             if shop and shop != self.cur_shop:
                 shop = "← " + shop  # from a shop you already left
-            if p is None:
+            if bought:
+                pays = self.npc_pays(real, qty)
+                res = "?" if pays is None else f"{pays - price:+,}"
+                vals, tag = (f"✔ BOUGHT  {real}", qty, f"{price:,}", "-" if pays is None else f"{pays:,}",
+                             res, "sell to NPC"), "bought"
+            elif unsure:
+                pays = self.npc_pays(real, qty) if real else None
+                vals, tag = (f"{real or raw} (price?)", qty, f"{price:,} ?", "-" if pays is None else f"{pays:,}",
+                             "check price", shop), "unsure"
+            elif p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
             else:
                 mark = " ✓" if real in self.learned.prices else ""
@@ -1067,9 +1124,16 @@ class App:
         """Re-run matching on everything in the list after the app learned something."""
         old = list(self.seen.values())
         self.seen.clear()
-        for _, raw, qty, price in old:
+        for v in old:
+            _, raw, qty, price = v
             real, _ = match_name(raw, self.names, self.learned)
-            self.seen[(real or raw, price)] = (real, raw, qty, price)
+            key = (real or raw, price)
+            self.seen[key] = (real, raw, qty, price)
+            if real_key(v) in self.bought_keys:
+                self.bought_keys[key] = self.bought_keys.pop(real_key(v))
+            if real_key(v) in self.unsure:
+                self.unsure.discard(real_key(v))
+                self.unsure.add(key)
         self.refresh()
 
     def learn_from_mesos(self, diff):
@@ -1077,15 +1141,29 @@ class App:
         and correct the prices automatically."""
         if diff < 0:
             spent = -diff
-            for v in self.seen.values():
-                real, raw, qty, price = v
-                if real and price == spent:
-                    self.seen.pop((real, price), None)
-                    self.root.after(0, self.refresh)
-                    self.bought.append([real, raw, qty, self.npc_pays(real, qty), spent])
-                    self.save_stats()
-                    self.say(f"Bought '{real}' for {spent:,}. Sell it to an NPC - I'll check the price.")
-                    return
+            cands = [(k, v) for k, v in self.seen.items() if v[0] and k not in self.bought_keys]
+            hit = [kv for kv in cands if kv[1][3] == spent]
+            if not hit:  # the shop price was misread (a digit lost: 2,999 read as 299)?
+                hit = [kv for kv in cands if lost_digits(str(kv[1][3]), str(spent))]
+            if len(hit) != 1 and not any(kv[1][3] == spent for kv in hit):
+                return
+            key, v = next((kv for kv in hit if kv[1][3] == spent), hit[0])
+            real, raw, qty, price = v
+            if price != spent:  # show what you really paid
+                self.seen.pop(key, None)
+                self.unsure.discard(key)
+                v = (real, raw, qty, spent)
+                key = real_key(v)
+                self.seen[key] = v
+                self.seen_shop.setdefault(key, self.cur_shop)
+            self.bought_keys[key] = spent
+            pays = self.npc_pays(real, qty)
+            self.bought.append([real, raw, qty, pays, spent])
+            self.save_stats()
+            self.root.after(0, self.refresh)
+            res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
+            fix = f" (the shop read {price:,} - fixed)" if price != spent else ""
+            self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
             return
         if not self.bought:
             return
@@ -1095,6 +1173,7 @@ class App:
                 if item not in self.learned.prices:
                     self.learned.set_price(item, self.unit_price(item))
                 self.record_flip(item, paid, diff)
+                self.sold(item)
                 self.say(f"✓ Confirmed: '{item}' sold for {diff:,} exactly as predicted.")
                 self.refresh()
                 return
@@ -1102,6 +1181,12 @@ class App:
             self.apply_sale(0, diff)
         else:
             self.ask_which_sold(diff)
+
+    def sold(self, item):
+        """Sold to the NPC: the 'BOUGHT' row is done."""
+        for k in [k for k in self.bought_keys if k[0] == item][:1]:
+            self.bought_keys.pop(k)
+            self.seen.pop(k, None)
 
     def save_stats(self):
         save_json(STATS_FILE, self.stats)
@@ -1172,6 +1257,7 @@ class App:
         unit = got if stars or qty == 1 else round(got / qty)
         self.learned.set_price(item, unit)
         self.record_flip(item, paid, got)
+        self.sold(item)
         self.say(f"Corrected: '{item}' sold for {got:,}, not {expect:,}. Price fixed for the future.")
         self.refresh()
 
@@ -1249,13 +1335,15 @@ class App:
         until they are bought."""
         for key, v in list(self.seen.items()):
             p = self.profit(v)
-            if p is None or p <= 0 or p < self.min_p():
+            if (p is None or p <= 0 or p < self.min_p()) and key not in self.bought_keys:
                 del self.seen[key]
+                self.unsure.discard(key)
         self.cur_shop = seller
         self.refresh()
 
     def clear(self):
-        self.seen.clear()
+        self.seen = {k: v for k, v in self.seen.items() if k in self.bought_keys}
+        self.unsure.clear()
         self.refresh()
 
     # ---- mesos tracker
