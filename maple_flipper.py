@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.45"
+VERSION = "0.46"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -721,6 +721,8 @@ class App:
         self.cur_shop = ""
         self.shops = load_json(SHOPS_FILE, {})
         self.session_t = time.time()
+        self.on_page = set()  # item keys on the shop page you are looking at right now
+        self.seen_t = {}  # item key -> when it was last on screen
         self.count = {}  # item key -> how many identical rows the shop page has (Lemona ×2)
         self.watch = self.cfg.get("watch", [])  # item names (or parts) to always tell you about
         self.watch_seen = set()
@@ -1153,6 +1155,8 @@ class App:
 
     def apply_scan(self, items, rects, mark_box, auto, took):
         new_good, new_watch, marks, page = False, [], [], {}
+        if items:
+            self.on_page = set()
         for i, (name, qty, price, sure) in enumerate(items):
             real, score = match_name(name, self.names, self.learned)
             key = (real or name, price)
@@ -1171,6 +1175,8 @@ class App:
             self.seen[key] = v
             self.seen_shop[key] = self.cur_shop
             page[key] = page.get(key, 0) + 1
+            self.on_page.add(key)
+            self.seen_t[key] = time.time()
             watched = self.watched(real or name)
             if watched and (key, self.cur_shop) not in self.watch_seen:
                 self.watch_seen.add((key, self.cur_shop))
@@ -1234,14 +1240,20 @@ class App:
         here = [(p, v) for p, v in here if p is not None and p > 0 and p >= self.min_p()]
         eye = "   👀 " + ", ".join(f"{v[0] or v[1]} {v[3]:,}" for v in watched[:2]) if watched else ""
         if here:
-            p, v = max(here, key=lambda x: x[0])
+            # what you can click right now first, then the rest of the shop
+            p, v = max(here, key=lambda x: (real_key(x[1]) in self.on_page, x[0]))
+            where = ""
+            if real_key(v) not in self.on_page:
+                t = self.seen_t.get(real_key(v), 0)
+                where = (f"  [seen {ago(t)} - may be gone]" if time.time() - t > 120
+                         else "  [other page - scroll]")
             n = self.count.get(real_key(v), 1)
             total = sum(x[0] * self.count.get(real_key(x[1]), 1) for x in here)
             rows = sum(self.count.get(real_key(x[1]), 1) for x in here)
             more = f"   ({rows} to buy, total +{total:,})" if rows > 1 else ""
             hot = p >= max(10000, 10 * self.min_p())
             times = f" ×{n}" if n > 1 else ""
-            self.set_banner(f"{'💰' if hot else '✅'} BUY: {v[0]}{times}  for {v[3]:,}  →  +{p:,}{more}{eye}",
+            self.set_banner(f"{'💰' if hot else '✅'} BUY: {v[0]}{times}  for {v[3]:,}  →  +{p:,}{where}{more}{eye}",
                             "#ffd23f" if hot else "#2fb344", "#000" if hot else "#fff")
         elif watched:
             v = watched[0]
@@ -1781,6 +1793,7 @@ class App:
                 self.unsure.discard(key)
         self.save_shop()  # the shop you just left
         self.cur_shop = seller
+        self.on_page = set()
         self.shops_today += 1
         name = self.known_shop(seller)
         rec = self.shops.get(name) if name else None
