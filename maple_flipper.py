@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.36"
+VERSION = "0.37"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -322,12 +322,38 @@ def read_price(crop, verify=True):
     return qty, price, False
 
 
+def ink_width(crop):
+    """Pixel width of the dark text in a 'N for X mesos' line (the game font has digits and
+    letters of about the same width, so the width tells how many characters there really are)."""
+    g = crop[:, :, :3].mean(axis=2) if crop.ndim == 3 else crop
+    xs = np.nonzero((g < np.median(g) - 70).any(axis=0))[0]
+    if len(xs) < 2:
+        return None
+    end = xs[0]
+    for x in xs[1:]:  # stop at the first big gap (scrollbar / window border further right)
+        if x - end > 20:
+            break
+        end = x
+    return end - xs[0]
+
+
+_char_px = []  # recent pixel widths per character of shop price lines that read cleanly
+
+
+def width_fits(w, qty, price, ref):
+    """Does '1 for 2,999 mesos' have the width the line really has on screen?
+    A dropped digit ('2,999' read as '299') makes it ~1-2 characters too short."""
+    if not w or not ref:
+        return True
+    return abs(w - ref * len(f"{qty} for {price:,} mesos")) <= 0.5 * ref
+
+
 def read_rows(img, rows, width=320, seed=False, worth=None):
     """Read the shop rows at known places. Returns (name, qty, price, row rect, sure) per row.
     seed=True stores the text the full scan already read, so nothing is read twice.
     worth(name, qty, price) -> True: only those rows get the slower double-check of the price
     (rows that aren't worth buying don't need it - that is most of them)."""
-    items = []
+    found = []
     for (nx, ny, nh, ntext), (px, py, ph, ptext) in rows:
         if min(nx, ny, px, py) < 0 or ny + nh > img.shape[0] or py + ph > img.shape[0]:
             return []
@@ -340,11 +366,22 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
         if not got:
             continue  # empty slot / tooltip in the way
         name = read_line(crops[1])
-        qty, cost, sure = got
-        if worth and (not sure or worth(name, qty, cost)):
-            qty, cost, sure = read_price(crops[0]) or got
         if re.search(r"[A-Za-z]{2}", name):
-            items.append((name, qty, cost, (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4)), sure))
+            rect = (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4))
+            found.append((name, got, crops[0], rect, ink_width(crops[0])))
+    # how wide one character is: the median over this page and earlier pages
+    here = [w / len(f"{q} for {p:,} mesos") for _, (q, p, sure), _, _, w in found if w and sure]
+    ref = float(np.median(_char_px + here)) if len(_char_px + here) >= 3 else None
+    items = []
+    for name, (qty, cost, sure), crop, rect, w in found:
+        fits = width_fits(w, qty, cost, ref)
+        if worth and (not sure or not fits or worth(name, qty, cost)):
+            qty, cost, sure = read_price(crop) or (qty, cost, sure)
+            fits = width_fits(w, qty, cost, ref)
+        items.append((name, qty, cost, rect, sure and fits))
+        if w and sure and fits:
+            _char_px.append(w / len(f"{qty} for {cost:,} mesos"))
+    del _char_px[:-60]
     return items
 
 
