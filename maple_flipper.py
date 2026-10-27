@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "1.3"
+VERSION = "1.4"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -194,6 +194,13 @@ def find_shop_items(lines):
 
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def npc_value(name, unit_price, qty):
+    """Stars/bullets are one rechargeable item: the shop shows the ammo count, not a stack."""
+    if any(k in norm(name) for k in ("throwingstar", "bullet")):
+        return unit_price
+    return unit_price * qty
 
 
 def match_name(name, names):
@@ -419,7 +426,7 @@ class App:
         real, _, qty, price = v
         if not real:
             return None
-        return self.prices[real] * qty - price
+        return npc_value(real, self.prices[real], qty) - price
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
@@ -432,7 +439,7 @@ class App:
             if p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-"), "unknown"
             else:
-                vals = (real, qty, f"{price:,}", f"{self.prices[real] * qty:,}", f"{p:+,}")
+                vals = (real, qty, f"{price:,}", f"{npc_value(real, self.prices[real], qty):,}", f"{p:+,}")
                 tag = "good" if p > 0 else "bad"
             self.tree.insert("", "end", values=vals, tags=(tag,))
 
