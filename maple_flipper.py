@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.29"
+VERSION = "0.30"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -256,7 +256,9 @@ def read_line(img):
         if len(_rec_cache) > 2000:
             _rec_cache.clear()
         res, _ = _ocr(img, use_det=False, use_cls=False)
-        _rec_cache[key] = res[0][1].strip() if res and res[0] and res[0][1] else ""
+        # depending on the version a row is [box, text, score] or [text, score]
+        text = next((x for x in (res[0] if res and res[0] else []) if isinstance(x, str)), "")
+        _rec_cache[key] = text.strip()
     return _rec_cache[key]
 
 
@@ -329,6 +331,13 @@ def find_shop_button(img):
         if below is not None and (below > 0.3).sum() >= 3 and (above > 0.3).sum() >= 3:
             return (x + 3) * c * 2, y * c * 2
     return None
+
+
+def seller_sig(img, btn):
+    """Pixels of the seller's name tag (left of the buttons): changes when it's another shop."""
+    x, y = int(btn[0]), int(btn[1])
+    tag = img[max(y + 60, 0):y + 95, max(x - 300, 0):max(x - 60, 0)]
+    return hash(tag.tobytes()) if tag.size else None
 
 
 def find_shop_items(lines):
@@ -506,6 +515,7 @@ class App:
         self.scanned = None
         self.rows = []
         self.shop_btn = None
+        self.shop_sig = None
         self.shop_seen = 0.0
         self.busy_since = 0.0
         self.prices = load_prices()
@@ -642,7 +652,8 @@ class App:
                         continue
                 if not box:  # no shop known: look for one (cheap colour check, no OCR)
                     time.sleep(0.25)
-                    btn = find_shop_button(grab()[:, :, ::-1])
+                    screen = grab()
+                    btn = find_shop_button(screen[:, :, ::-1])
                     if not btn:
                         tried = None
                         continue
@@ -650,9 +661,11 @@ class App:
                     if any(abs(btn[0] - t[0]) < 40 and abs(btn[1] - t[1]) < 40 for t in tried):
                         continue  # already looked here (NPC shop / not a shop)
                     tried.append(btn)
+                    sig = seller_sig(screen, btn)
                     same_shop = self.shop_btn and abs(btn[0] - self.shop_btn[0]) < 40 \
-                        and abs(btn[1] - self.shop_btn[1]) < 40 and time.time() - self.shop_seen < 15
-                    self.shop_btn = btn
+                        and abs(btn[1] - self.shop_btn[1]) < 40 and sig == self.shop_sig \
+                        and time.time() - self.shop_seen < 15
+                    self.shop_btn, self.shop_sig = btn, sig
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     cand = {"left": max(x - 400, mon["left"]), "top": max(y + 40, mon["top"]),
                             "width": 560, "height": 600}
@@ -670,6 +683,17 @@ class App:
             same = lambda x, y: x is not None and y is not None and x.shape == y.shape and np.array_equal(x, y)
             # the list stopped moving and shows something we haven't read yet -> scan it
             if same(img, last) and not same(img, self.scanned):
+                screen = grab()
+                btn = find_shop_button(screen[:, :, ::-1])
+                if not btn:
+                    last = img
+                    continue  # buttons hidden for a moment (mouse hover): try again
+                if (abs(btn[0] - self.shop_btn[0]) > 40 or abs(btn[1] - self.shop_btn[1]) > 40
+                        or seller_sig(screen, btn) != self.shop_sig):
+                    # another shop: forget this one so it is detected (and cleared) as new
+                    self.shop_box, self.shop_btn, self.shop_sig, last, tried = None, None, None, None, None
+                    self.root.after(0, self.hide_marks)
+                    continue
                 self.root.after(0, self.scan, True)
             last = img
 
@@ -753,7 +777,7 @@ class App:
                 if _ocr is None:
                     self.say("Loading the text reader (first scan only, a few seconds)...")
                 t = time.time()
-                lines, items, rects, src = [], [], [], img
+                lines, items, rects, src, mark_box = [], [], [], img, box
                 if box and box is self.shop_box and self.rows:
                     items = read_rows(img, self.rows)  # fast: known rows, cached text
                 if not items:
@@ -798,7 +822,7 @@ class App:
                         else:
                             self.rows = []
                     self.shop_box = nb
-                    box = nb
+                    mark_box = nb
                 elif box and not items and not auto:
                     self.shop_box = None
                 new_good, marks = False, []
@@ -812,8 +836,8 @@ class App:
                     self.seen[key] = v
                     if rects and p is not None and p > 0 and p >= self.min_p():
                         marks.append((rects[i], p))
-                if box and box is self.shop_box:
-                    self.root.after(0, self.draw_marks, box, marks)
+                if mark_box and mark_box is self.shop_box:
+                    self.root.after(0, self.draw_marks, mark_box, marks)
                 if new_good and self.beep.get():
                     import winsound
                     winsound.MessageBeep(winsound.MB_ICONASTERISK)
