@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.28"
+VERSION = "0.29"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -628,7 +628,7 @@ class App:
                 with mss.mss() as sct:
                     mon = sct.monitors[0]
                 box = self.shop_box
-                if box and time.time() - checked > 2.5:  # is the shop still open / still there?
+                if box and time.time() - checked > 0.5:  # is the shop still open / still there?
                     checked = time.time()
                     btn = find_shop_button(grab()[:, :, ::-1])  # screen grabs are BGR
                     moved = btn and self.shop_btn and (abs(btn[0] - self.shop_btn[0]) > 40
@@ -654,8 +654,8 @@ class App:
                         and abs(btn[1] - self.shop_btn[1]) < 40 and time.time() - self.shop_seen < 15
                     self.shop_btn = btn
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
-                    cand = {"left": max(x - 400, mon["left"]), "top": max(y - 40, mon["top"]),
-                            "width": 560, "height": 680}
+                    cand = {"left": max(x - 400, mon["left"]), "top": max(y + 40, mon["top"]),
+                            "width": 560, "height": 600}
                     if self.cfg.get("auto_clear", True) and not same_shop:
                         self.root.after(0, self.clear)  # new shop: start a fresh list
                     self.say("Shop detected - reading it...")
@@ -753,7 +753,7 @@ class App:
                 if _ocr is None:
                     self.say("Loading the text reader (first scan only, a few seconds)...")
                 t = time.time()
-                lines, items, rects = [], [], []
+                lines, items, rects, src = [], [], [], img
                 if box and box is self.shop_box and self.rows:
                     items = read_rows(img, self.rows)  # fast: known rows, cached text
                 if not items:
@@ -767,7 +767,8 @@ class App:
                 img_origin = origin
                 if not items and (not self.shop_box or not auto):
                     # not a player shop here: read the whole screen (shop moved, or an NPC shop)
-                    lines, img_origin = ocr(grab()), full
+                    src = grab()
+                    lines, img_origin = ocr(src), full
                     items = find_shop_items(lines)
                     if not items:
                         npc = find_npc_items(lines)
@@ -778,10 +779,26 @@ class App:
                     x0 = min(o["x"] for o in prices_l) + img_origin["left"]
                     y0 = min(o["y"] for o in prices_l) + img_origin["top"]
                     y1 = max(o["y"] for o in prices_l) + img_origin["top"]
-                    self.shop_box = {"left": int(max(x0 - 120, full["left"])),
-                                     "top": int(max(y0 - 55, full["top"])),
-                                     "width": 470, "height": int(y1 - y0 + 75)}
-                    self.rows = []  # new box: learn the row positions on the next scan
+                    nb = {"left": int(max(x0 - 120, full["left"])), "top": int(max(y0 - 55, full["top"])),
+                          "width": 470, "height": int(y1 - y0 + 75)}
+                    # reuse this scan for the list area: row positions + text, no second scan
+                    dx, dy = img_origin["left"] - nb["left"], img_origin["top"] - nb["top"]
+                    sx, sy = -dx, -dy
+                    sub = src[sy:sy + nb["height"], sx:sx + nb["width"]] if sx >= 0 and sy >= 0 else None
+                    self.rows = []
+                    if sub is not None and sub.shape[:2] == (nb["height"], nb["width"]):
+                        sub = np.ascontiguousarray(sub)
+                        shifted = [{**o, "x": o["x"] + dx, "y": o["y"] + dy} for o in lines]
+                        self.rows = shop_rows(shifted)
+                        got = read_rows(sub, self.rows, seed=True)
+                        if got:
+                            items = [it[:3] for it in got]
+                            rects = [it[3] for it in got]
+                            self.scanned = sub  # the loop now only rescans when the list changes
+                        else:
+                            self.rows = []
+                    self.shop_box = nb
+                    box = nb
                 elif box and not items and not auto:
                     self.shop_box = None
                 new_good, marks = False, []
