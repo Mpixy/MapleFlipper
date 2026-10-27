@@ -19,14 +19,14 @@ from tkinter import ttk, messagebox
 import mss
 import numpy as np
 import requests
-from rapidfuzz import fuzz, process
+from rapidfuzz.distance import Levenshtein
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # real pixels on scaled displays
 except Exception:
     pass
 
-VERSION = "1.4"
+VERSION = "1.5"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -204,18 +204,25 @@ def npc_value(name, unit_price, qty):
 
 
 def match_name(name, names):
-    raw_trunc = name.rstrip().endswith((".", "…"))
-    name = name.rstrip(".… ")
-    if not name:
+    """Exact item only. Allows 1 OCR typo (2 for long names); anything more is another item."""
+    truncated = name.rstrip().endswith((".", "…"))
+    key = norm(name.rstrip(".… "))
+    if not key:
         return None, 0
-    truncated = raw_trunc
-    best = process.extractOne(name, names, scorer=fuzz.ratio, processor=norm)
-    if best and best[1] >= (95 if truncated else 88):
-        return best[0], best[1]
+    by_key = {}
+    for n in names:
+        by_key.setdefault(norm(n), n)
     if truncated:  # shop cuts long names: "Earring LUK Scroll: Inter..."
-        pre = [n for n in names if norm(n).startswith(norm(name))]
-        if len(pre) == 1:
-            return pre[0], 95
+        pre = {k for k in by_key if k.startswith(key)}
+        return (by_key[pre.pop()], 95) if len(pre) == 1 else (None, 0)
+    if key in by_key:
+        return by_key[key], 100
+    allowed = 2 if len(key) >= 15 else 1
+    close = [(Levenshtein.distance(key, k), k) for k in by_key
+             if abs(len(k) - len(key)) <= allowed]
+    close = sorted(c for c in close if c[0] <= allowed)
+    if close and (len(close) == 1 or close[0][0] < close[1][0]):
+        return by_key[close[0][1]], 90
     return None, 0
 
 
