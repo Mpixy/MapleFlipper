@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.23"
+VERSION = "0.24"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -235,7 +235,7 @@ def ocr(img):
             _ocr = RapidOCR(intra_op_num_threads=2, inter_op_num_threads=1)
         except TypeError:
             _ocr = RapidOCR()
-    res, _ = _ocr(img)
+    res, _ = _ocr(img, use_cls=False)  # text is never upside down: skip that step
     out = []
     for box, text, score in res or []:
         xs = [p[0] for p in box]
@@ -420,6 +420,7 @@ class App:
         self.learned = Learned()
         self.bought = []  # (item, qty, expected NPC value) bought this session, waiting to be sold
         self.shop_box = None
+        self.scanned = None
         self.prices = load_prices()
         self.names = list(self.prices)
         self.seen = {}
@@ -524,11 +525,10 @@ class App:
     def auto_loop(self):
         """Finds a player shop by itself (orange BUY ITEM button), rescans it when the list
         changes (scrolling) and notices when it closes."""
-        last, stable, tried, checked = None, 0, None, 0.0
+        last, tried, checked = None, None, 0.0
         while True:
-            time.sleep(0.8)
+            time.sleep(0.12)
             if not self.auto.get() or self.busy:
-                last = None
                 continue
             try:
                 with mss.mss() as sct:
@@ -541,7 +541,7 @@ class App:
                         self.say("Shop closed - waiting for the next shop.")
                         continue
                 if not box:  # no shop known: look for one (cheap colour check, no OCR)
-                    time.sleep(0.7)
+                    time.sleep(0.5)
                     btn = find_shop_button(grab()[:, :, ::-1])
                     if not btn:
                         tried = None
@@ -560,12 +560,10 @@ class App:
                 img = grab(box)
             except Exception:
                 continue
-            if last is not None and img.shape == last.shape and np.array_equal(img, last):
-                stable += 1
-                if stable == 1:  # changed and then settled: scroll finished
-                    self.root.after(0, self.scan, True)
-            else:
-                stable = -1 if last is not None else 1  # first frame is not a change
+            same = lambda x, y: x is not None and y is not None and x.shape == y.shape and np.array_equal(x, y)
+            # the list stopped moving and shows something we haven't read yet -> scan it
+            if same(img, last) and not same(img, self.scanned):
+                self.root.after(0, self.scan, True)
             last = img
 
     def start_hotkey(self):
@@ -633,6 +631,7 @@ class App:
             time.sleep(0.1)
         try:
             img = grab(box) if box else grab()
+            self.scanned = img if box else None
             full_img = None if box else img
         finally:
             if hide:
