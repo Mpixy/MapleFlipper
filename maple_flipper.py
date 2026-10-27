@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.22"
+VERSION = "0.23"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -454,7 +454,7 @@ class App:
         style.configure("Big.TButton", font=("Segoe UI", 14, "bold"), padding=10)
         ttk.Label(r, text=f"v{VERSION}", font=("Segoe UI", 9, "bold"),
                   foreground="#666").pack(anchor="w", padx=8, pady=(4, 0))
-        ttk.Button(r, text="🔍  SCAN SHOP  (F8)", style="Big.TButton",
+        ttk.Button(r, text="🔍  SCAN THIS PAGE  (F8)", style="Big.TButton",
                    command=self.scan).pack(fill="x", padx=8, pady=(8, 4))
 
         bar = ttk.Frame(r)
@@ -522,20 +522,27 @@ class App:
         messagebox.showinfo("How to use MapleFlipper", HELP_TEXT)
 
     def auto_loop(self):
-        """Finds a player shop by itself (orange BUY ITEM button) and rescans when it changes."""
-        last, stable, tried = None, 0, None
+        """Finds a player shop by itself (orange BUY ITEM button), rescans it when the list
+        changes (scrolling) and notices when it closes."""
+        last, stable, tried, checked = None, 0, None, 0.0
         while True:
             time.sleep(0.8)
             if not self.auto.get() or self.busy:
                 last = None
                 continue
-            box = self.shop_box
             try:
+                with mss.mss() as sct:
+                    mon = sct.monitors[0]
+                box = self.shop_box
+                if box and time.time() - checked > 2.5:  # is the shop still open?
+                    checked = time.time()
+                    if not find_shop_button(grab()[:, :, ::-1]):  # screen grabs are BGR
+                        self.shop_box, last, tried = None, None, None
+                        self.say("Shop closed - waiting for the next shop.")
+                        continue
                 if not box:  # no shop known: look for one (cheap colour check, no OCR)
                     time.sleep(0.7)
-                    with mss.mss() as sct:
-                        mon = sct.monitors[0]
-                    btn = find_shop_button(grab()[:, :, ::-1])  # screen grabs are BGR
+                    btn = find_shop_button(grab()[:, :, ::-1])
                     if not btn:
                         tried = None
                         continue
@@ -549,6 +556,7 @@ class App:
                     self.root.after(0, self.scan, True, cand)
                     last = None
                     continue
+                tried = None
                 img = grab(box)
             except Exception:
                 continue
@@ -651,9 +659,7 @@ class App:
                     self.shop_box = {"left": int(max(x0 - 120, full["left"])),
                                      "top": int(max(y0 - 110, full["top"])),
                                      "width": 520, "height": int(y1 - y0 + 170)}
-                elif box and not items:
-                    if self.shop_box:
-                        self.say("Shop closed - waiting for the next shop.")
+                elif box and not items and not auto:
                     self.shop_box = None
                 new_good = False
                 for name, qty, price in items:
