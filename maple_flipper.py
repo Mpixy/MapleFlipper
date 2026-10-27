@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.19"
+VERSION = "0.20"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -34,6 +34,7 @@ PRICES_FILE = os.path.join(DATA, "prices.json")
 CUSTOM_FILE = os.path.join(DATA, "custom_prices.txt")
 CONFIG_FILE = os.path.join(DATA, "config.json")
 LOG_FILE = os.path.join(DATA, "mesos_log.csv")
+LEARN_FILE = os.path.join(DATA, "learned.json")
 BUNDLED_PRICES = os.path.join(getattr(sys, "_MEIPASS", HERE), "prices.json")
 ITEM_URL = "https://meowdb.com/msclassic/item-db/{}"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -175,6 +176,47 @@ def load_prices():
     return db
 
 
+# ---------------------------------------------------------------- self-learning
+
+class Learned:
+    """Corrections the app learned from real NPC sales and from the user.
+
+    prices:  item -> real NPC price per unit (beats MeowDB)
+    aliases: text read on screen -> the item it really is
+    blocked: text read on screen -> items it must never be matched to
+    """
+
+    def __init__(self):
+        d = load_json(LEARN_FILE, {})
+        self.prices = d.get("prices", {})
+        self.aliases = d.get("aliases", {})
+        self.blocked = d.get("blocked", {})
+
+    def save(self):
+        save_json(LEARN_FILE, {"prices": self.prices, "aliases": self.aliases,
+                               "blocked": self.blocked})
+
+    def block(self, seen_text, wrong_item):
+        lst = self.blocked.setdefault(norm(seen_text), [])
+        if wrong_item not in lst:
+            lst.append(wrong_item)
+        self.aliases.pop(norm(seen_text), None)
+        self.save()
+
+    def alias(self, seen_text, right_item):
+        self.aliases[norm(seen_text)] = right_item
+        self.save()
+
+    def set_price(self, item, unit_price):
+        self.prices[item] = unit_price
+        self.save()
+
+    def forget(self, item):
+        self.prices.pop(item, None)
+        self.aliases = {k: v for k, v in self.aliases.items() if v != item}
+        self.save()
+
+
 # ---------------------------------------------------------------- OCR
 
 _ocr = None
@@ -238,8 +280,14 @@ def npc_value(name, unit_price, qty):
     return unit_price * qty
 
 
-def match_name(name, names):
+def match_name(name, names, learned=None):
     """Exact item only. Allows 1 OCR typo (2 for long names); anything more is another item."""
+    if learned:
+        if norm(name) in learned.aliases:
+            return learned.aliases[norm(name)], 100
+        blocked = set(learned.blocked.get(norm(name), []))
+        if blocked:
+            names = [n for n in names if n not in blocked]
     truncated = name.rstrip().endswith((".", "…"))
     key = norm(name.rstrip(".… "))
     if not key:
@@ -313,6 +361,15 @@ TRACK YOUR MESOS
 2. Click 'Set mesos area' and drag a box around the mesos number.
 3. Click 'Start tracking'. Every buy / NPC sale is logged with the profit.
 
+After the first F8 the app finds the shop window and rescans by itself
+when you scroll or open another shop (turn off with 'Auto').
+
+THE APP LEARNS
+- With mesos tracking on, buy an item and sell it to an NPC: the app checks
+  the real price. If it was wrong, it fixes it for next time (marked ✓).
+- Right-click a row to say 'wrong item', pick the right one, or type the
+  real NPC price. It remembers forever.
+
 Orange '(?)' = no price known for that item.
 Double-click any row to look the item up on MeowDB.
 Min profit = only highlight items that earn at least this much.
@@ -331,6 +388,9 @@ class App:
             self.root.geometry(self.cfg["geometry"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.report_callback_exception = lambda *exc: log_error(*exc)
+        self.learned = Learned()
+        self.bought = []  # (item, qty, expected NPC value) bought this session, waiting to be sold
+        self.shop_box = None
         self.prices = load_prices()
         self.names = list(self.prices)
         self.seen = {}
@@ -340,6 +400,7 @@ class App:
         self.build_ui()
         self.root.bind_all("<F8>", lambda e: self.scan())
         self.start_hotkey()
+        threading.Thread(target=self.auto_loop, daemon=True).start()
         if len(self.prices) < 500 or os.path.exists(PRICES_FILE + ".progress"):  # first run / cut off
             self.root.after(300, self.update_db)
         else:
@@ -378,6 +439,8 @@ class App:
         e = ttk.Entry(bar, textvariable=self.min_profit, width=8)
         e.pack(side="left", padx=(2, 8))
         e.bind("<KeyRelease>", lambda ev: self.refresh())
+        self.auto = tk.BooleanVar(value=self.cfg.get("auto", True))
+        ttk.Checkbutton(bar, text="Auto", variable=self.auto).pack(side="left", padx=(0, 6))
         self.beep = tk.BooleanVar(value=self.cfg.get("beep", True))
         ttk.Checkbutton(bar, text="Beep", variable=self.beep).pack(side="left")
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
@@ -394,6 +457,7 @@ class App:
         self.tree.tag_configure("unknown", foreground="#c07000")
         self.tree.pack(fill="both", expand=True, padx=8, pady=6)
         self.tree.bind("<Double-1>", self.open_item)
+        self.tree.bind("<Button-3>", self.row_menu)
 
         box = ttk.LabelFrame(r, text="Mesos tracker")
         box.pack(fill="x", padx=8, pady=4)
@@ -427,6 +491,27 @@ class App:
 
     def show_help(self):
         messagebox.showinfo("How to use MapleFlipper", HELP_TEXT)
+
+    def auto_loop(self):
+        """After the first F8 the app knows where the shop is; rescan by itself when it changes."""
+        last, stable = None, 0
+        while True:
+            time.sleep(0.8)
+            box = self.shop_box
+            if not (box and self.auto.get()) or self.busy:
+                last = None
+                continue
+            try:
+                img = grab(box)
+            except Exception:
+                continue
+            if last is not None and img.shape == last.shape and np.array_equal(img, last):
+                stable += 1
+                if stable == 1:  # changed and then settled: scroll finished
+                    self.root.after(0, self.scan, True)
+            else:
+                stable = -1 if last is not None else 1  # first frame is not a change
+            last = img
 
     def start_hotkey(self):
         """Poll the real key state: works even when the game swallows the key press."""
@@ -469,29 +554,61 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     # ---- shop scan
-    def scan(self):
+    def overlaps_me(self, box):
+        r = self.root
+        x, y, w, h = r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height()
+        return not (x > box["left"] + box["width"] or x + w < box["left"]
+                    or y > box["top"] + box["height"] or y + h < box["top"])
+
+    def scan(self, auto=False):
         if self.busy:
-            self.say("Still working on the previous scan - one moment...")
+            if not auto:
+                self.say("Still working on the previous scan - one moment...")
             return
         self.busy = True
-        self.say("F8 pressed - reading the screen...")
-        self.root.attributes("-alpha", 0.0)  # don't OCR our own window
-        self.root.update()
-        time.sleep(0.1)
+        if not auto:
+            self.say("F8 pressed - reading the screen...")
+        box = self.shop_box
+        with mss.mss() as sct:
+            full = sct.monitors[0]
+        hide = self.overlaps_me(box or full)
+        if hide:
+            self.root.attributes("-alpha", 0.0)  # don't OCR our own window
+            self.root.update()
+            time.sleep(0.1)
         try:
-            img = grab()
+            img = grab(box) if box else grab()
+            full_img = None if box else img
         finally:
-            self.root.attributes("-alpha", 1.0)
+            if hide:
+                self.root.attributes("-alpha", 1.0)
+        origin = box or full
 
         def work():
             try:
                 if _ocr is None:
                     self.say("Loading the text reader (first scan only, a few seconds)...")
                 t = time.time()
-                items = find_shop_items(ocr(img))
+                lines = ocr(img)
+                items = find_shop_items(lines)
+                if not items and box and not auto:  # shop moved: look at the whole screen again
+                    lines, img_origin = ocr(grab()), full
+                    items = find_shop_items(lines)
+                else:
+                    img_origin = origin
+                prices_l = [o for o in lines if PRICE_LINE.search(o["text"])]
+                if items and prices_l:  # remember where the shop is so next scans are fast
+                    x0 = min(o["x"] for o in prices_l) + img_origin["left"]
+                    y0 = min(o["y"] for o in prices_l) + img_origin["top"]
+                    y1 = max(o["y"] for o in prices_l) + img_origin["top"]
+                    self.shop_box = {"left": int(max(x0 - 120, full["left"])),
+                                     "top": int(max(y0 - 110, full["top"])),
+                                     "width": 520, "height": int(y1 - y0 + 170)}
+                elif box and not items:
+                    self.shop_box = None
                 new_good = False
                 for name, qty, price in items:
-                    real, score = match_name(name, self.names)
+                    real, score = match_name(name, self.names, self.learned)
                     key = (real or name, price)
                     v = (real, name, qty, price)
                     p = self.profit(v)
@@ -503,8 +620,9 @@ class App:
                     winsound.MessageBeep(winsound.MB_ICONASTERISK)
                 self.root.after(0, self.refresh)
                 n_good = sum(1 for v in self.seen.values() if self.profit(v) and self.profit(v) > 0)
-                self.say(f"Scan took {time.time() - t:.1f}s. Found {len(items)} items on screen. Profitable so far: {n_good}. "
-                         f"Scroll the shop and scan again for more.")
+                if items or not auto:
+                    self.say(f"Scan took {time.time() - t:.1f}s. Found {len(items)} items. "
+                             f"Profitable so far: {n_good}.")
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
                 self.say(f"Scan failed: {e}")
@@ -512,11 +630,17 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def unit_price(self, item):
+        return self.learned.prices.get(item, self.prices.get(item))
+
+    def npc_pays(self, item, qty):
+        u = self.unit_price(item)
+        return None if u is None else npc_value(item, u, qty)
+
     def profit(self, v):
         real, _, qty, price = v
-        if not real:
-            return None
-        return npc_value(real, self.prices[real], qty) - price
+        pays = self.npc_pays(real, qty) if real else None
+        return None if pays is None else pays - price
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
@@ -529,9 +653,143 @@ class App:
             if p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-"), "unknown"
             else:
-                vals = (real, qty, f"{price:,}", f"{npc_value(real, self.prices[real], qty):,}", f"{p:+,}")
+                mark = " ✓" if real in self.learned.prices else ""
+                vals = (real, qty, f"{price:,}", f"{self.npc_pays(real, qty):,}{mark}", f"{p:+,}")
                 tag = "good" if p > 0 and p >= self.min_p() else "bad"
-            self.tree.insert("", "end", values=vals, tags=(tag,))
+            self.tree.insert("", "end", iid=f"{raw}|{price}", values=vals, tags=(tag,))
+
+    # ---- teaching
+    def row_value(self, iid):
+        raw, price = iid.rsplit("|", 1)
+        for v in self.seen.values():
+            if v[1] == raw and v[3] == int(price):
+                return v
+        return None
+
+    def row_menu(self, event):
+        iid = self.tree.identify_row(event.y)
+        v = iid and self.row_value(iid)
+        if not v:
+            return
+        self.tree.selection_set(iid)
+        real, raw, qty, price = v
+        m = tk.Menu(self.root, tearoff=0)
+        if real:
+            m.add_command(label=f"Wrong item - it is NOT '{real}'", command=lambda: self.fix_item(v, wrong=True))
+        m.add_command(label="Pick the correct item...", command=lambda: self.fix_item(v))
+        if real:
+            m.add_command(label=f"Set real NPC price of '{real}'...", command=lambda: self.ask_price(real))
+            if real in self.learned.prices:
+                m.add_command(label="Forget what was learned for this item",
+                              command=lambda: (self.learned.forget(real), self.rematch()))
+        m.tk_popup(event.x_root, event.y_root)
+
+    def fix_item(self, v, wrong=False):
+        real, raw, qty, price = v
+        if wrong:
+            self.learned.block(raw, real)
+            self.say(f"Learned: '{raw}' is not '{real}'.")
+        top = tk.Toplevel(self.root)
+        top.title("Which item is it?")
+        top.attributes("-topmost", True)
+        ttk.Label(top, text=f"Shop shows: {raw}\nType to search, then double-click the right item:").pack(padx=8, pady=6)
+        q = tk.StringVar(value=raw.rstrip(".… "))
+        ent = ttk.Entry(top, textvariable=q, width=40)
+        ent.pack(padx=8)
+        lb = tk.Listbox(top, height=12, width=45)
+        lb.pack(padx=8, pady=6)
+        blocked = set(self.learned.blocked.get(norm(raw), []))
+
+        def fill(*_):
+            key = norm(q.get())
+            hits = sorted((n for n in self.names if key in norm(n) and n not in blocked),
+                          key=lambda n: (len(n), n))[:200]
+            lb.delete(0, "end")
+            for n in hits:
+                lb.insert("end", n)
+
+        def choose(_=None):
+            if lb.curselection():
+                item = lb.get(lb.curselection()[0])
+                self.learned.alias(raw, item)
+                self.say(f"Learned: '{raw}' = '{item}'. It will be matched this way from now on.")
+                top.destroy()
+                self.rematch()
+
+        q.trace_add("write", fill)
+        lb.bind("<Double-1>", choose)
+        ttk.Button(top, text="Use selected", command=choose).pack(pady=(0, 8))
+        fill()
+        ent.focus_set()
+        if wrong:
+            self.rematch()
+
+    def ask_price(self, item):
+        from tkinter import simpledialog
+        cur = self.unit_price(item)
+        prompt = f"How much does an NPC pay for ONE '{item}'?"
+        if cur is not None:
+            prompt += f"\n(currently {cur:,})"
+        val = simpledialog.askinteger("Real NPC price", prompt, parent=self.root,
+                                      initialvalue=cur, minvalue=0)
+        if val is not None:
+            self.learned.set_price(item, val)
+            self.say(f"Learned: NPC pays {val:,} for '{item}'.")
+            self.refresh()
+
+    def rematch(self):
+        """Re-run matching on everything in the list after the app learned something."""
+        old = list(self.seen.values())
+        self.seen.clear()
+        for _, raw, qty, price in old:
+            real, _ = match_name(raw, self.names, self.learned)
+            self.seen[(real or raw, price)] = (real, raw, qty, price)
+        self.refresh()
+
+    def learn_from_mesos(self, diff):
+        """Buying from a shop and selling to an NPC show up as mesos changes: use them to check
+        and correct the prices automatically."""
+        if diff < 0:
+            spent = -diff
+            for v in self.seen.values():
+                real, raw, qty, price = v
+                if real and price == spent:
+                    self.bought.append((real, qty, self.npc_pays(real, qty)))
+                    self.say(f"Bought '{real}' for {spent:,}. Sell it to an NPC - I'll check the price.")
+                    return
+            return
+        if not self.bought:
+            return
+        for i, (item, qty, expect) in enumerate(self.bought):
+            if expect == diff:
+                self.bought.pop(i)
+                if item not in self.learned.prices:
+                    self.learned.set_price(item, self.unit_price(item))
+                self.say(f"✓ Confirmed: '{item}' sold for {diff:,} exactly as predicted.")
+                self.refresh()
+                return
+        if len(self.bought) == 1:
+            self.apply_sale(0, diff)
+        else:
+            self.ask_which_sold(diff)
+
+    def apply_sale(self, i, got):
+        item, qty, expect = self.bought.pop(i)
+        stars = npc_value(item, 1, qty) == 1
+        unit = got if stars or qty == 1 else round(got / qty)
+        self.learned.set_price(item, unit)
+        self.say(f"Corrected: '{item}' sold for {got:,}, not {expect:,}. Price fixed for the future.")
+        self.refresh()
+
+    def ask_which_sold(self, got):
+        top = tk.Toplevel(self.root)
+        top.title("What did you just sell?")
+        top.attributes("-topmost", True)
+        ttk.Label(top, text=f"You got {got:,} mesos. Which item did you sell?").pack(padx=10, pady=6)
+        for i, (item, qty, expect) in enumerate(self.bought):
+            ttk.Button(top, text=f"{item}  (expected {expect:,})",
+                       command=lambda i=i: (top.destroy(), self.apply_sale(i, got))).pack(fill="x", padx=10, pady=2)
+        ttk.Button(top, text="Something else - ignore", command=top.destroy).pack(pady=8)
 
     def min_p(self):
         return to_int(self.min_profit.get()) or 0
@@ -546,7 +804,8 @@ class App:
                             urllib.parse.quote(f"site:meowdb.com/msclassic {name}"))
 
     def on_close(self):
-        self.cfg.update(geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get())
+        self.cfg.update(geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
+                        auto=self.auto.get())
         save_json(CONFIG_FILE, self.cfg)
         self.root.destroy()
 
@@ -619,6 +878,7 @@ class App:
             stamp = time.strftime("%H:%M:%S")
             self.hist.insert(0, f"{stamp}  {diff:+12,}  {kind}")
             self.say(f"Mesos changed {diff:+,} (now {v:,})")
+            self.learn_from_mesos(diff)
             new_file = not os.path.exists(LOG_FILE)
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 if new_file:
