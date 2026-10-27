@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.24"
+VERSION = "0.25"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -298,6 +298,32 @@ def find_shop_items(lines):
     return items
 
 
+NPC_LINE = re.compile(r"^[^\d]{0,4}(\d[\d,.]*)\s*mes", re.I)  # "(coin) 1,500 Mesos"
+
+
+def find_npc_items(lines):
+    """Rows of an NPC shop / sell list: item name with 'N Mesos' under it. The stack size
+    is the small number on the icon to the left."""
+    items = []
+    for ln in lines:
+        if PRICE_LINE.search(ln["text"]) or not NPC_LINE.search(ln["text"]):
+            continue
+        price = to_int(NPC_LINE.search(ln["text"]).group(1))
+        above = [o for o in lines if o is not ln and abs(o["x"] - ln["x"]) < 60
+                 and 0 < ln["y"] - o["y"] < 2.5 * max(ln["h"], 12)
+                 and not NPC_LINE.search(o["text"]) and re.search(r"[A-Za-z]{2}", o["text"])]
+        if price is None or not above:
+            continue
+        name_ln = max(above, key=lambda o: o["y"])
+        qty = 1
+        for o in lines:
+            if (re.fullmatch(r"\d{1,4}", o["text"]) and o["x"] < name_ln["x"] - 5
+                    and ln["x"] - o["x"] < 120 and name_ln["y"] - 10 <= o["y"] <= ln["y"] + 25):
+                qty = int(o["text"])
+        items.append((name_ln["text"], qty, price))
+    return items
+
+
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
@@ -396,6 +422,8 @@ a player shop and scans it, and rescans when you scroll.
 THE APP LEARNS
 - With mesos tracking on, buy an item and sell it to an NPC: the app checks
   the real price. If it was wrong, it fixes it for next time (marked ✓).
+- Open any NPC shop: the app reads the real sell prices shown there
+  (and the Buy Back tab) and fixes its prices and names by itself.
 - Right-click a row to say 'wrong item', pick the right one, or type the
   real NPC price. It remembers forever.
 
@@ -418,11 +446,11 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.report_callback_exception = lambda *exc: log_error(*exc)
         self.learned = Learned()
-        self.bought = []  # (item, qty, expected NPC value) bought this session, waiting to be sold
+        self.bought = []  # (item, text read, qty, expected NPC value) bought this session, waiting to be sold
         self.shop_box = None
         self.scanned = None
         self.prices = load_prices()
-        self.names = list(self.prices)
+        self.names = sorted(set(self.prices) | set(self.learned.prices))
         self.seen = {}
         self.tracking = False
         self.mesos = self.start_mesos = None
@@ -546,13 +574,14 @@ class App:
                     if not btn:
                         tried = None
                         continue
-                    if tried and abs(btn[0] - tried[0]) < 20 and abs(btn[1] - tried[1]) < 20:
-                        continue  # already looked here and it wasn't a shop
-                    tried = btn
+                    tried = tried or []
+                    if any(abs(btn[0] - t[0]) < 40 and abs(btn[1] - t[1]) < 40 for t in tried):
+                        continue  # already looked here (NPC shop / not a shop)
+                    tried.append(btn)
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     cand = {"left": max(x - 400, mon["left"]), "top": max(y - 40, mon["top"]),
                             "width": 560, "height": 680}
-                    self.say("Shop window detected - scanning...")
+                    self.say("Shop detected - reading it...")
                     self.root.after(0, self.scan, True, cand)
                     last = None
                     continue
@@ -645,11 +674,15 @@ class App:
                 t = time.time()
                 lines = ocr(img)
                 items = find_shop_items(lines)
-                if not items and box and not auto:  # shop moved: look at the whole screen again
+                img_origin = origin
+                if not items and (not self.shop_box or not auto):
+                    # not a player shop here: read the whole screen (shop moved, or an NPC shop)
                     lines, img_origin = ocr(grab()), full
                     items = find_shop_items(lines)
-                else:
-                    img_origin = origin
+                    if not items:
+                        npc = find_npc_items(lines)
+                        if npc:
+                            self.root.after(0, self.learn_npc, npc)
                 prices_l = [o for o in lines if PRICE_LINE.search(o["text"])]
                 if items and prices_l:  # remember where the shop is so next scans are fast
                     x0 = min(o["x"] for o in prices_l) + img_origin["left"]
@@ -808,13 +841,13 @@ class App:
             for v in self.seen.values():
                 real, raw, qty, price = v
                 if real and price == spent:
-                    self.bought.append((real, qty, self.npc_pays(real, qty)))
+                    self.bought.append((real, raw, qty, self.npc_pays(real, qty)))
                     self.say(f"Bought '{real}' for {spent:,}. Sell it to an NPC - I'll check the price.")
                     return
             return
         if not self.bought:
             return
-        for i, (item, qty, expect) in enumerate(self.bought):
+        for i, (item, _, qty, expect) in enumerate(self.bought):
             if expect == diff:
                 self.bought.pop(i)
                 if item not in self.learned.prices:
@@ -827,8 +860,47 @@ class App:
         else:
             self.ask_which_sold(diff)
 
+    def learn_npc(self, rows):
+        """An NPC shop shows the real price for everything you could sell (and the Buy Back
+        tab shows what you just sold): treat it as ground truth."""
+        learned, fixed = 0, []
+        for name, qty, price in rows:
+            if name.rstrip().endswith((".", "…")) or len(norm(name)) < 4:
+                continue
+            real, score = match_name(name, self.names, self.learned)
+            if not real or score < 100:
+                if " " not in name.strip():
+                    continue  # OCR glued the words together: not reliable enough to learn
+                real = name.strip()  # not in MeowDB: remember it as shown
+            known = self.unit_price(real)
+            if qty <= 1 and known and price > known and price % known == 0:
+                continue  # a stack (the count on the icon wasn't readable): price matches
+            unit = price if (qty <= 1 or npc_value(real, 1, qty) == 1) else round(price / qty)
+            # something bought from a player shop under a shorter / wrong name?
+            for i, (b_real, b_raw, b_qty, expect) in enumerate(self.bought):
+                if b_real != real and norm(real).startswith(norm(b_raw.rstrip(".… "))):
+                    self.bought.pop(i)
+                    if norm(b_raw) in {norm(n) for n in self.prices}:
+                        # the shorter name is a real item too: can't remap it, just warn
+                        fixed.append(f"you bought '{real}', not '{b_raw}' (the shop name was cut off)")
+                    else:
+                        self.learned.alias(b_raw, real)
+                        fixed.append(f"'{b_raw}' is really '{real}'")
+                    break
+            if self.unit_price(real) != unit or real not in self.learned.prices:
+                self.learned.set_price(real, unit)
+                learned += 1
+        if real_names := set(self.learned.prices) - set(self.names):
+            self.names += sorted(real_names)
+        if fixed:
+            self.say("Corrected: " + "; ".join(fixed))
+        if learned:
+            self.say(f"Learned {learned} real NPC prices from the NPC shop.")
+        if learned or fixed:
+            self.rematch()
+
     def apply_sale(self, i, got):
-        item, qty, expect = self.bought.pop(i)
+        item, _, qty, expect = self.bought.pop(i)
         stars = npc_value(item, 1, qty) == 1
         unit = got if stars or qty == 1 else round(got / qty)
         self.learned.set_price(item, unit)
@@ -840,7 +912,7 @@ class App:
         top.title("What did you just sell?")
         top.attributes("-topmost", True)
         ttk.Label(top, text=f"You got {got:,} mesos. Which item did you sell?").pack(padx=10, pady=6)
-        for i, (item, qty, expect) in enumerate(self.bought):
+        for i, (item, _, qty, expect) in enumerate(self.bought):
             ttk.Button(top, text=f"{item}  (expected {expect:,})",
                        command=lambda i=i: (top.destroy(), self.apply_sale(i, got))).pack(fill="x", padx=10, pady=2)
         ttk.Button(top, text="Something else - ignore", command=top.destroy).pack(pady=8)
