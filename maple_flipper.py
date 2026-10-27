@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.15"
+VERSION = "0.16"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
