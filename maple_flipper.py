@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.41"
+VERSION = "0.42"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -203,10 +203,22 @@ class Learned:
         self.prices = d.get("prices", {})
         self.aliases = d.get("aliases", {})
         self.blocked = d.get("blocked", {})
+        self.manual = set(d.get("manual", []))  # prices the user typed in: always trusted
 
     def save(self):
         save_json(LEARN_FILE, {"prices": self.prices, "aliases": self.aliases,
-                               "blocked": self.blocked})
+                               "blocked": self.blocked, "manual": sorted(self.manual)})
+
+    def drop_wild(self, db):
+        """Forget learned prices that are 3x off MeowDB: those came from a sale matched to the
+        wrong item (e.g. Lemona 1,800 learned as 11,800), not from a real price change."""
+        bad = [n for n, p in self.prices.items() if n not in self.manual and db.get(n)
+               and not db[n] / 3 <= p <= db[n] * 3]
+        for n in bad:
+            del self.prices[n]
+        if bad:
+            self.save()
+        return bad
 
     def block(self, seen_text, wrong_item):
         lst = self.blocked.setdefault(norm(seen_text), [])
@@ -690,6 +702,7 @@ class App:
         self.shop_seen = 0.0
         self.busy_since = 0.0
         self.prices = load_prices()
+        self.wild = self.learned.drop_wild(self.prices)
         self.names = sorted(set(self.prices) | set(self.learned.prices))
         self.seen = {}
         self.seen_shop = {}  # item key -> seller name
@@ -714,6 +727,8 @@ class App:
             self.root.after(300, self.update_db)
         else:
             self.say(f"Ready - {len(self.prices):,} item prices loaded. Open a player shop and press F8.")
+        if self.wild:
+            self.say(f"Fixed {len(self.wild)} wrongly learned prices (back to MeowDB): {', '.join(self.wild[:8])}")
         if not getattr(sys, "frozen", False) and not os.path.isdir(os.path.join(HERE, ".git")):
             self.root.after(3000, self.check_update)
         if self.cfg.get("tracking") and self.cfg.get("meso_area"):
@@ -1089,6 +1104,15 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def plausible(self, item, qty, got):
+        """Could `got` mesos really be what an NPC paid for this? (MeowDB is rarely far off;
+        a big difference means something else was sold / gained at the same time)"""
+        db = self.prices.get(item)
+        if not db:
+            return True
+        exp = npc_value(item, db, qty)
+        return exp * 0.6 <= got <= exp * 1.6
+
     def worth(self, name, qty, price):
         """Would this row show up as profitable? (only those get their price double-checked)"""
         real, _ = match_name(name, self.names, self.learned)
@@ -1276,6 +1300,7 @@ class App:
         val = simpledialog.askinteger("Real NPC price", prompt, parent=self.root,
                                       initialvalue=cur, minvalue=0)
         if val is not None:
+            self.learned.manual.add(item)
             self.learned.set_price(item, val)
             self.say(f"Learned: NPC pays {val:,} for '{item}'.")
             self.refresh()
@@ -1343,8 +1368,10 @@ class App:
         kinds = {tuple(sorted(self.bought[i][0] for i in c)) for c in combos}
         if len(kinds) == 1:
             self.sold_many(combos[0])
-        elif len(self.bought) == 1:
+        elif len(self.bought) == 1 and self.plausible(self.bought[0][0], self.bought[0][2], diff):
             self.apply_sale(0, diff)
+        elif len(self.bought) == 1:
+            return  # a gain that has nothing to do with it (another sale, a quest, a drop)
         else:
             self.sell_dialog(diff, combos[0] if combos else ())
 
@@ -1406,6 +1433,9 @@ class App:
                         self.learned.alias(b_raw, real)
                         fixed.append(f"'{b_raw}' is really '{real}'")
                     break
+            db = self.prices.get(real)
+            if db and not db / 3 <= unit <= db * 3 and real not in self.learned.manual:
+                continue  # a misread digit on the NPC shop, not a real price
             if self.unit_price(real) != unit or real not in self.learned.prices:
                 self.learned.set_price(real, unit)
                 learned += 1
@@ -1420,6 +1450,13 @@ class App:
 
     def apply_sale(self, i, got):
         item, _, qty, expect, paid = self.bought.pop(i)
+        if not self.plausible(item, qty, got):  # don't learn nonsense: just count the flip
+            self.record_flip(item, paid, expect if expect is not None else got)
+            self.sold(item)
+            self.say(f"Sold '{item}' - got {got:,} but it should pay ~{expect:,}; "
+                     f"price NOT changed (right-click the row to set it yourself).")
+            self.refresh()
+            return
         stars = npc_value(item, 1, qty) == 1
         unit = got if stars or qty == 1 else round(got / qty)
         self.learned.set_price(item, unit)
