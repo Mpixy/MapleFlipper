@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.32"
+VERSION = "0.33"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -228,17 +228,19 @@ class Learned:
 # ---------------------------------------------------------------- OCR
 
 _ocr = None
+_ocr_lock = threading.Lock()  # the reader is used from the scan and the auto-detect threads
 
 
 def ocr(img):
     global _ocr
-    if _ocr is None:
-        from rapidocr_onnxruntime import RapidOCR
-        try:
-            _ocr = RapidOCR(intra_op_num_threads=3, inter_op_num_threads=1)
-        except TypeError:
-            _ocr = RapidOCR()
-    res, _ = _ocr(img, use_cls=False)  # text is never upside down: skip that step
+    with _ocr_lock:
+        if _ocr is None:
+            from rapidocr_onnxruntime import RapidOCR
+            try:
+                _ocr = RapidOCR(intra_op_num_threads=3, inter_op_num_threads=1)
+            except TypeError:
+                _ocr = RapidOCR()
+        res, _ = _ocr(img, use_cls=False)  # text is never upside down: skip that step
     out = []
     for box, text, score in res or []:
         xs = [p[0] for p in box]
@@ -258,7 +260,8 @@ def read_line(img):
     if key not in _rec_cache:
         if len(_rec_cache) > 2000:
             _rec_cache.clear()
-        res, _ = _ocr(img, use_det=False, use_cls=False)
+        with _ocr_lock:
+            res, _ = _ocr(img, use_det=False, use_cls=False)
         # depending on the version a row is [box, text, score] or [text, score]
         text = next((x for x in (res[0] if res and res[0] else []) if isinstance(x, str)), "")
         _rec_cache[key] = text.strip()
@@ -345,6 +348,10 @@ def seller_name(img, btn):
     if _ocr is None:
         ocr(np.zeros((32, 32, 3), np.uint8))  # load the reader
     return read_line(np.ascontiguousarray(tag))
+
+
+def same_seller(a, b):
+    return bool(a) and bool(b) and Levenshtein.distance(norm(a), norm(b)) <= 2
 
 
 def changed(a, b, limit=0.01):
@@ -733,7 +740,7 @@ class App:
                         continue  # already looked here (NPC shop / not a shop)
                     tried.append(btn)
                     sig = seller_name(screen, btn)
-                    same_shop = sig == self.shop_sig and time.time() - self.shop_seen < 60
+                    same_shop = same_seller(sig, self.shop_sig) and time.time() - self.shop_seen < 60
                     self.shop_btn, self.shop_sig = btn, sig
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     cand = {"left": max(x - 400, mon["left"]), "top": max(y + 40, mon["top"]),
@@ -757,7 +764,7 @@ class App:
                     last = img
                     continue  # buttons hidden for a moment (mouse hover): try again
                 if (abs(btn[0] - self.shop_btn[0]) > 40 or abs(btn[1] - self.shop_btn[1]) > 40
-                        or seller_name(screen, btn) != self.shop_sig):
+                        or not same_seller(seller_name(screen, btn), self.shop_sig)):
                     # another shop: forget this one so it is detected (and cleared) as new
                     self.shop_box, self.shop_btn, self.shop_sig, last, tried = None, None, None, None, None
                     self.root.after(0, self.hide_marks)
