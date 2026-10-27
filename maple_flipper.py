@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.46"
+VERSION = "0.47"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -444,14 +444,30 @@ def find_shop_button(img):
 
 
 def seller_name(img, btn):
-    """Read the seller's name tag under the avatar (left of the buttons)."""
+    """Read the seller's name tag under the avatar (left of the buttons): find the dark blue
+    tag itself, then read its white text enlarged as black on white - much steadier."""
+    import cv2
     x, y = int(btn[0]), int(btn[1])
-    tag = img[max(y + 62, 0):y + 95, max(x - 330, 0):max(x - 110, 0)]
-    if not tag.size:
+    y0, x0 = max(y + 20, 0), max(x - 380, 0)
+    area = img[y0:y + 150, x0:max(x - 60, 0)]
+    if not area.size:
         return ""
+    b, g, r = (area[:, :, k].astype(int) for k in range(3))
+    navy = (abs(b - 82) < 25) & (abs(g - 54) < 25) & (abs(r - 31) < 25)
+    rows = np.nonzero(navy.sum(axis=1) > 60)[0]
     if _ocr is None:
         ocr(np.zeros((32, 32, 3), np.uint8))  # load the reader
-    return read_line(np.ascontiguousarray(tag))
+    if len(rows) < 8:  # no tag found: fall back to the old fixed spot
+        tag = img[max(y + 62, 0):y + 95, max(x - 330, 0):max(x - 110, 0)]
+        return read_line(np.ascontiguousarray(tag)) if tag.size else ""
+    band = navy[rows[0]:rows[-1] + 1]
+    cols = np.nonzero(band.sum(axis=0) > len(band) * 0.3)[0]
+    tag = area[rows[0] + 1:rows[-1], cols[0] + 2:cols[-1] - 1]
+    gray = cv2.cvtColor(np.ascontiguousarray(tag), cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    text = np.where(gray > 140, 0, 255).astype(np.uint8)
+    text = cv2.copyMakeBorder(text, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=255)
+    return read_line(np.ascontiguousarray(cv2.cvtColor(text, cv2.COLOR_GRAY2BGR))).strip(" .")
 
 
 def ago(t):
@@ -941,11 +957,16 @@ class App:
                         continue  # already looked here (NPC shop / not a shop)
                     tried.append(btn)
                     sig = seller_name(screen, btn)
-                    same_shop = same_seller(sig, self.shop_sig) and time.time() - self.shop_seen < 60
-                    self.shop_btn, self.shop_sig = btn, sig
+                    near = self.shop_btn is not None and abs(btn[0] - self.shop_btn[0]) < 40 \
+                        and abs(btn[1] - self.shop_btn[1]) < 40
+                    # name unreadable this time: the same spot a moment ago is the same shop
+                    same_shop = time.time() - self.shop_seen < 60 and (
+                        same_seller(sig, self.shop_sig) or (near and not (sig and self.shop_sig)))
+                    self.shop_btn, self.shop_sig = btn, sig or (self.shop_sig if same_shop else "")
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
-                    cand = {"left": max(x - 400, mon["left"]), "top": max(y + 40, mon["top"]),
-                            "width": 560, "height": 600}
+                    # just the item list (left half, under the buttons): less to read = faster
+                    cand = {"left": max(x - 330, mon["left"]), "top": max(y + 80, mon["top"]),
+                            "width": 420, "height": 520}
                     if not same_shop:
                         self.root.after(0, self.new_shop, sig)
                     self.say(f"Shop of {sig or '?'} - reading it...")
@@ -964,8 +985,9 @@ class App:
                 if not btn:
                     last = img
                     continue  # buttons hidden for a moment (mouse hover): try again
+                now = seller_name(screen, btn)
                 if (abs(btn[0] - self.shop_btn[0]) > 40 or abs(btn[1] - self.shop_btn[1]) > 40
-                        or not same_seller(seller_name(screen, btn), self.shop_sig)):
+                        or (now and self.shop_sig and not same_seller(now, self.shop_sig))):
                     # another shop: forget this one so it is detected (and cleared) as new
                     self.shop_box, self.shop_btn, self.shop_sig, last, tried = None, None, None, None, None
                     self.root.after(0, self.hide_marks)
