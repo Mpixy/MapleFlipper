@@ -26,6 +26,7 @@ try:
 except Exception:
     pass
 
+VERSION = "1.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -270,7 +271,7 @@ Orange '(?)' = no price known for that item.
 class App:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("MapleFlipper")
+        self.root.title(f"MapleFlipper v{VERSION}")
         self.root.attributes("-topmost", True)
         self.root.geometry("560x620")
         self.cfg = load_json(CONFIG_FILE, {})
@@ -351,17 +352,16 @@ class App:
         messagebox.showinfo("How to use MapleFlipper", HELP_TEXT)
 
     def start_hotkey(self):
-        """System-wide F8 via RegisterHotKey, which games can't swallow like keyboard hooks."""
+        """Poll the real key state: works even when the game swallows the key press."""
         def loop():
-            from ctypes import wintypes
             user32 = ctypes.windll.user32
-            if not user32.RegisterHotKey(None, 1, 0x4000, 0x77):  # MOD_NOREPEAT, VK_F8
-                self.say("F8 is taken by another program - use the SCAN button.")
-                return
-            msg = wintypes.MSG()
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-                if msg.message == 0x0312:  # WM_HOTKEY
+            was_down = False
+            while True:
+                down = bool(user32.GetAsyncKeyState(0x77) & 0x8000)  # VK_F8
+                if down and not was_down:
                     self.root.after(0, self.scan)
+                was_down = down
+                time.sleep(0.03)
         threading.Thread(target=loop, daemon=True).start()
 
     # ---- prices
