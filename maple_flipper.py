@@ -159,6 +159,7 @@ def download_release_prices():
     db = r.json()
     if len(db) < 500:
         raise ValueError("price list too small")
+    db = {**load_json(PRICES_FILE, {}), **db}  # keep items only found by a local download
     save_json(PRICES_FILE, db)
     if os.path.exists(PRICES_FILE + ".progress"):
         os.remove(PRICES_FILE + ".progress")
