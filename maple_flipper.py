@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.27"
+VERSION = "0.28"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -506,6 +506,8 @@ class App:
         self.scanned = None
         self.rows = []
         self.shop_btn = None
+        self.shop_seen = 0.0
+        self.busy_since = 0.0
         self.prices = load_prices()
         self.names = sorted(set(self.prices) | set(self.learned.prices))
         self.seen = {}
@@ -615,9 +617,11 @@ class App:
     def auto_loop(self):
         """Finds a player shop by itself (orange BUY ITEM button), rescans it when the list
         changes (scrolling) and notices when it closes."""
-        last, tried, checked = None, None, 0.0
+        last, tried, checked, misses = None, None, 0.0, 0
         while True:
             time.sleep(0.12)
+            if self.busy and time.time() - self.busy_since > 15:
+                self.busy = False  # safety net: a scan never takes this long
             if not self.auto.get() or self.busy:
                 continue
             try:
@@ -627,9 +631,11 @@ class App:
                 if box and time.time() - checked > 2.5:  # is the shop still open / still there?
                     checked = time.time()
                     btn = find_shop_button(grab()[:, :, ::-1])  # screen grabs are BGR
-                    moved = btn and self.shop_btn and (abs(btn[0] - self.shop_btn[0]) > 20
-                                                       or abs(btn[1] - self.shop_btn[1]) > 20)
-                    if not btn or moved:
+                    moved = btn and self.shop_btn and (abs(btn[0] - self.shop_btn[0]) > 40
+                                                       or abs(btn[1] - self.shop_btn[1]) > 40)
+                    misses = misses + 1 if (not btn or moved) else 0
+                    if misses >= 2:  # mouse hover can hide the button for a moment
+                        misses = 0
                         self.shop_box, last, tried = None, None, None
                         self.root.after(0, self.hide_marks)
                         self.say("Shop closed - waiting for the next shop.")
@@ -644,17 +650,20 @@ class App:
                     if any(abs(btn[0] - t[0]) < 40 and abs(btn[1] - t[1]) < 40 for t in tried):
                         continue  # already looked here (NPC shop / not a shop)
                     tried.append(btn)
+                    same_shop = self.shop_btn and abs(btn[0] - self.shop_btn[0]) < 40 \
+                        and abs(btn[1] - self.shop_btn[1]) < 40 and time.time() - self.shop_seen < 15
                     self.shop_btn = btn
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     cand = {"left": max(x - 400, mon["left"]), "top": max(y - 40, mon["top"]),
                             "width": 560, "height": 680}
-                    if self.cfg.get("auto_clear", True):
+                    if self.cfg.get("auto_clear", True) and not same_shop:
                         self.root.after(0, self.clear)  # new shop: start a fresh list
                     self.say("Shop detected - reading it...")
                     self.root.after(0, self.scan, True, cand)
                     last = None
                     continue
                 tried = None
+                self.shop_seen = time.time()
                 img = grab(box)
             except Exception:
                 continue
@@ -716,7 +725,7 @@ class App:
             if not auto:
                 self.say("Still working on the previous scan - one moment...")
             return
-        self.busy = True
+        self.busy, self.busy_since = True, time.time()
         if not auto:
             self.say("F8 pressed - reading the screen...")
         box = box or self.shop_box
@@ -730,7 +739,10 @@ class App:
         try:
             img = grab(box) if box else grab()
             self.scanned = img if box else None
-            full_img = None if box else img
+        except Exception as e:  # never leave the app stuck in "busy"
+            log_error(type(e), e, e.__traceback__)
+            self.shop_box, self.busy = None, False
+            return
         finally:
             if hide:
                 self.root.attributes("-alpha", 1.0)
@@ -767,8 +779,8 @@ class App:
                     y0 = min(o["y"] for o in prices_l) + img_origin["top"]
                     y1 = max(o["y"] for o in prices_l) + img_origin["top"]
                     self.shop_box = {"left": int(max(x0 - 120, full["left"])),
-                                     "top": int(max(y0 - 110, full["top"])),
-                                     "width": 470, "height": int(y1 - y0 + 170)}
+                                     "top": int(max(y0 - 55, full["top"])),
+                                     "width": 470, "height": int(y1 - y0 + 75)}
                     self.rows = []  # new box: learn the row positions on the next scan
                 elif box and not items and not auto:
                     self.shop_box = None
@@ -791,7 +803,7 @@ class App:
                 self.root.after(0, self.refresh)
                 n_good = sum(1 for v in self.seen.values() if self.profit(v) and self.profit(v) > 0)
                 if items or not auto:
-                    self.say(f"Scan took {time.time() - t:.1f}s. Found {len(items)} items. "
+                    self.say(("Page changed - " if auto else "") + f"Scan took {time.time() - t:.1f}s. Found {len(items)} items. "
                              f"Profitable so far: {n_good}.")
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
