@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.17"
+VERSION = "0.18"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -117,7 +117,7 @@ def update_prices(progress, max_id=12000, path=PRICES_FILE):
     state = load_json(state_file, {"next": 1, "found": 0, "misses": 0})  # resume a cut-off download
     first, found, misses, stats = state["next"], state["found"], state["misses"], {}
     t0 = time.time()
-    with cf.ThreadPoolExecutor(10) as pool:
+    with cf.ThreadPoolExecutor(6) as pool:
         for start in range(first, max_id, 50):
             for iid, res in pool.map(lambda i: fetch_item(session, i), range(start, start + 50)):
                 if isinstance(res, tuple):
@@ -132,8 +132,9 @@ def update_prices(progress, max_id=12000, path=PRICES_FILE):
                      f"{found:,} items found)  ~{int(left // 60)}:{int(left % 60):02d} left at most", done / max_id)
             if found and misses > 2500:
                 break  # well past the last item
-            save_json(path, db)
-            save_json(state_file, {"next": start + 50, "found": found, "misses": misses})
+            if start % 1000 == 951:  # save every 1000 ids so a cut-off download can resume
+                save_json(path, db)
+                save_json(state_file, {"next": start + 50, "found": found, "misses": misses})
     with open(os.path.join(DATA, "update_log.txt"), "w", encoding="utf-8") as f:
         f.write(f"found={found} total={len(db)} misses={stats}\n")
     if db:
@@ -141,6 +142,22 @@ def update_prices(progress, max_id=12000, path=PRICES_FILE):
     if os.path.exists(state_file):
         os.remove(state_file)
     return found, len(db)
+
+
+RELEASE_PRICES = "https://github.com/Mpixy/MapleFlipper/releases/download/latest/prices.json"
+
+
+def download_release_prices():
+    """Ready-made price list built by GitHub (one small download instead of crawling MeowDB)."""
+    r = requests.get(RELEASE_PRICES, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    db = r.json()
+    if len(db) < 500:
+        raise ValueError("price list too small")
+    save_json(PRICES_FILE, db)
+    if os.path.exists(PRICES_FILE + ".progress"):
+        os.remove(PRICES_FILE + ".progress")
+    return len(db)
 
 
 def load_prices():
@@ -167,7 +184,10 @@ def ocr(img):
     global _ocr
     if _ocr is None:
         from rapidocr_onnxruntime import RapidOCR
-        _ocr = RapidOCR()
+        try:
+            _ocr = RapidOCR(intra_op_num_threads=2, inter_op_num_threads=1)
+        except TypeError:
+            _ocr = RapidOCR()
     res, _ = _ocr(img)
     out = []
     for box, text, score in res or []:
@@ -417,7 +437,12 @@ class App:
 
         def work():
             try:
-                found, total = update_prices(self.say)
+                self.say("Downloading the latest price list...", 0.5)
+                try:
+                    total = download_release_prices()
+                    found = total
+                except Exception:  # no release yet: fall back to reading MeowDB directly
+                    found, total = update_prices(self.say)
                 self.prices = load_prices()
                 self.names = list(self.prices)
                 if found == 0:
@@ -523,11 +548,11 @@ class App:
                      else "Mesos area saved, but no number was read - try a slightly bigger box.")
         pick_region(self.root, done)
 
-    def read_mesos(self):
+    def read_mesos(self, img=None):
         area = self.cfg.get("meso_area")
         if not area:
             return None
-        nums = [to_int(o["text"]) for o in ocr(grab(area))]
+        nums = [to_int(o["text"]) for o in ocr(grab(area) if img is None else img)]
         nums = [n for n in nums if n is not None]
         return max(nums) if nums else None
 
@@ -544,10 +569,15 @@ class App:
             threading.Thread(target=self.track_loop, daemon=True).start()
 
     def track_loop(self):
-        pending, hits = None, 0
+        pending, hits, last_img = None, 0, None
         while self.tracking:
+            time.sleep(1.0)
             try:
-                v = self.read_mesos()
+                img = grab(self.cfg["meso_area"])
+                if last_img is not None and hits >= 2 and np.array_equal(img, last_img):
+                    continue  # nothing changed on screen: skip the expensive OCR
+                last_img = img
+                v = self.read_mesos(img)
             except Exception:
                 v = None
             if v is not None:
@@ -558,7 +588,6 @@ class App:
                     pending, hits = v, 1
                 if hits == 2 and v != self.mesos:
                     self.root.after(0, self.on_mesos, v)
-            time.sleep(0.7)
 
     def on_mesos(self, v):
         old = self.mesos
