@@ -100,6 +100,7 @@ def update_prices(progress, max_id=12000):
     db = load_json(PRICES_FILE, {})
     session = requests.Session()
     found, misses, stats = 0, 0, {}
+    t0 = time.time()
     with cf.ThreadPoolExecutor(10) as pool:
         for start in range(1, max_id, 50):
             for iid, res in pool.map(lambda i: fetch_item(session, i), range(start, start + 50)):
@@ -109,7 +110,10 @@ def update_prices(progress, max_id=12000):
                 else:
                     stats[res] = stats.get(res, 0) + 1
                     misses += 1
-            progress(f"Downloading prices... checked {start + 49}/{max_id}, found {found}")
+            done = start + 49
+            left = (time.time() - t0) / done * (max_id - done)
+            progress(f"Downloading prices... {done * 100 // max_id}%  ({done:,}/{max_id:,} checked, "
+                     f"{found:,} items found)  ~{int(left // 60)}:{int(left % 60):02d} left at most")
             if found and misses > 2500:
                 break  # well past the last item
             if found % 500 < 50:
