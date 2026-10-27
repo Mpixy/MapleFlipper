@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.20"
+VERSION = "0.21"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -110,7 +110,7 @@ def fetch_item(session, item_id):
     return item_id, "error"
 
 
-def update_prices(progress, max_id=12000, path=PRICES_FILE):
+def update_prices(progress, max_id=20000, path=PRICES_FILE):
     """Crawl MeowDB item pages by number. Ids are not contiguous, so scan a wide range."""
     db = load_json(path, {})
     session = requests.Session()
@@ -126,12 +126,16 @@ def update_prices(progress, max_id=12000, path=PRICES_FILE):
                     found, misses = found + 1, 0
                 else:
                     stats[res] = stats.get(res, 0) + 1
-                    misses += 1
+                    if res != "error":  # blocked/slow requests don't mean we reached the end
+                        misses += 1
+            if stats.get("error", 0) > 20 * (1 + start // 1000):
+                time.sleep(20)  # the site is pushing back: slow down
             done = start + 49
             left = (time.time() - t0) / max(done - first + 1, 1) * (max_id - done)
+            print(f"[crawl] {done} found={found} misses={misses} {stats}", flush=True) if not hasattr(progress, "__self__") else None
             progress(f"Downloading prices... {done * 100 // max_id}%  ({done:,}/{max_id:,} checked, "
                      f"{found:,} items found)  ~{int(left // 60)}:{int(left % 60):02d} left at most", done / max_id)
-            if found and misses > 2500:
+            if found and misses > 4000:
                 break  # well past the last item
             if start % 1000 == 951:  # save every 1000 ids so a cut-off download can resume
                 save_json(path, db)
