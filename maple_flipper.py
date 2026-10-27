@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.25"
+VERSION = "0.26"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -232,7 +232,7 @@ def ocr(img):
     if _ocr is None:
         from rapidocr_onnxruntime import RapidOCR
         try:
-            _ocr = RapidOCR(intra_op_num_threads=2, inter_op_num_threads=1)
+            _ocr = RapidOCR(intra_op_num_threads=3, inter_op_num_threads=1)
         except TypeError:
             _ocr = RapidOCR()
     res, _ = _ocr(img, use_cls=False)  # text is never upside down: skip that step
@@ -241,8 +241,54 @@ def ocr(img):
         xs = [p[0] for p in box]
         ys = [p[1] for p in box]
         out.append({"text": text.strip(), "x": min(xs), "y": (min(ys) + max(ys)) / 2,
-                    "h": max(ys) - min(ys)})
+                    "h": max(ys) - min(ys), "x2": max(xs)})
     return out
+
+
+_rec_cache = {}
+
+
+def read_line(img):
+    """Read one known text line (no text detection). Same pixels -> cached answer, so after
+    scrolling only the rows that actually changed cost anything."""
+    key = hash(img.tobytes())
+    if key not in _rec_cache:
+        if len(_rec_cache) > 2000:
+            _rec_cache.clear()
+        res, _ = _ocr(img, use_det=False, use_cls=False)
+        _rec_cache[key] = res[0][1].strip() if res and res[0] and res[0][1] else ""
+    return _rec_cache[key]
+
+
+def shop_rows(lines):
+    """Where each (name line, price line) pair sits, so later scans can skip detection."""
+    rows = []
+    for ln in lines:
+        if not PRICE_LINE.search(ln["text"]):
+            continue
+        above = [o for o in lines if o is not ln and abs(o["x"] - ln["x"]) < 40
+                 and 0 < ln["y"] - o["y"] < 2.5 * max(ln["h"], 12)]
+        if above:
+            nm = max(above, key=lambda o: o["y"])
+            rows.append([(int(r["x"]) - 4, int(r["y"] - r["h"] / 2) - 3, int(r["h"]) + 6)
+                         for r in (nm, ln)])
+    return rows
+
+
+def read_rows(img, rows, width=320):
+    items = []
+    for (nx, ny, nh), (px, py, ph) in rows:
+        if min(nx, ny, px, py) < 0 or ny + nh > img.shape[0] or py + ph > img.shape[0]:
+            return []
+        price = read_line(np.ascontiguousarray(img[py:py + ph, px:px + width]))
+        m = PRICE_LINE.search(price)
+        if not m:
+            continue  # empty slot / tooltip in the way
+        name = read_line(np.ascontiguousarray(img[ny:ny + nh, nx:nx + width]))
+        qty, cost = to_int(m.group(1)), to_int(m.group(2))
+        if qty and cost and re.search(r"[A-Za-z]{2}", name):
+            items.append((name, qty, cost))
+    return items
 
 
 def grab(region=None):
@@ -449,6 +495,8 @@ class App:
         self.bought = []  # (item, text read, qty, expected NPC value) bought this session, waiting to be sold
         self.shop_box = None
         self.scanned = None
+        self.rows = []
+        self.shop_btn = None
         self.prices = load_prices()
         self.names = sorted(set(self.prices) | set(self.learned.prices))
         self.seen = {}
@@ -562,14 +610,17 @@ class App:
                 with mss.mss() as sct:
                     mon = sct.monitors[0]
                 box = self.shop_box
-                if box and time.time() - checked > 2.5:  # is the shop still open?
+                if box and time.time() - checked > 2.5:  # is the shop still open / still there?
                     checked = time.time()
-                    if not find_shop_button(grab()[:, :, ::-1]):  # screen grabs are BGR
+                    btn = find_shop_button(grab()[:, :, ::-1])  # screen grabs are BGR
+                    moved = btn and self.shop_btn and (abs(btn[0] - self.shop_btn[0]) > 20
+                                                       or abs(btn[1] - self.shop_btn[1]) > 20)
+                    if not btn or moved:
                         self.shop_box, last, tried = None, None, None
                         self.say("Shop closed - waiting for the next shop.")
                         continue
                 if not box:  # no shop known: look for one (cheap colour check, no OCR)
-                    time.sleep(0.5)
+                    time.sleep(0.25)
                     btn = find_shop_button(grab()[:, :, ::-1])
                     if not btn:
                         tried = None
@@ -578,6 +629,7 @@ class App:
                     if any(abs(btn[0] - t[0]) < 40 and abs(btn[1] - t[1]) < 40 for t in tried):
                         continue  # already looked here (NPC shop / not a shop)
                     tried.append(btn)
+                    self.shop_btn = btn
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     cand = {"left": max(x - 400, mon["left"]), "top": max(y - 40, mon["top"]),
                             "width": 560, "height": 680}
@@ -672,8 +724,14 @@ class App:
                 if _ocr is None:
                     self.say("Loading the text reader (first scan only, a few seconds)...")
                 t = time.time()
-                lines = ocr(img)
-                items = find_shop_items(lines)
+                lines, items = [], []
+                if box and box is self.shop_box and self.rows:
+                    items = read_rows(img, self.rows)  # fast: known rows, cached text
+                if not items:
+                    lines = ocr(img)
+                    items = find_shop_items(lines)
+                    if box and items:
+                        self.rows = shop_rows(lines)
                 img_origin = origin
                 if not items and (not self.shop_box or not auto):
                     # not a player shop here: read the whole screen (shop moved, or an NPC shop)
@@ -684,13 +742,14 @@ class App:
                         if npc:
                             self.root.after(0, self.learn_npc, npc)
                 prices_l = [o for o in lines if PRICE_LINE.search(o["text"])]
-                if items and prices_l:  # remember where the shop is so next scans are fast
+                if items and prices_l and not (box and box is self.shop_box):  # remember where the shop is so next scans are fast
                     x0 = min(o["x"] for o in prices_l) + img_origin["left"]
                     y0 = min(o["y"] for o in prices_l) + img_origin["top"]
                     y1 = max(o["y"] for o in prices_l) + img_origin["top"]
                     self.shop_box = {"left": int(max(x0 - 120, full["left"])),
                                      "top": int(max(y0 - 110, full["top"])),
-                                     "width": 520, "height": int(y1 - y0 + 170)}
+                                     "width": 470, "height": int(y1 - y0 + 170)}
+                    self.rows = []  # new box: learn the row positions on the next scan
                 elif box and not items and not auto:
                     self.shop_box = None
                 new_good = False
