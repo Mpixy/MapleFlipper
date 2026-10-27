@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.38"
+VERSION = "0.39"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -337,6 +337,13 @@ def ink_width(crop):
     return end - xs[0]
 
 
+def faded(crop):
+    """Sold out / not for sale: the game greys the row out (darkest text ~185 instead of ~0)."""
+    g = crop[:, :, :3].mean(axis=2) if crop.ndim == 3 else crop
+    return np.percentile(g, 2) > 120
+
+
+last_faded = 0  # greyed-out rows the last read_rows skipped
 _char_px = []  # recent pixel widths per character of shop price lines that read cleanly
 
 
@@ -353,12 +360,16 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
     seed=True stores the text the full scan already read, so nothing is read twice.
     worth(name, qty, price) -> True: only those rows get the slower double-check of the price
     (rows that aren't worth buying don't need it - that is most of them)."""
-    found = []
+    global last_faded
+    found, last_faded = [], 0
     for (nx, ny, nh, ntext), (px, py, ph, ptext) in rows:
         if min(nx, ny, px, py) < 0 or ny + nh > img.shape[0] or py + ph > img.shape[0]:
             return []
         crops = [np.ascontiguousarray(img[y:y + h, x:x + width])
                  for x, y, h in ((px, py, ph), (nx, ny, nh))]
+        if faded(crops[0]):
+            last_faded += 1
+            continue  # greyed out: can't be bought, don't even read it
         if seed and ptext is not None:
             _rec_cache[hash(crops[0].tobytes())] = ptext
             _rec_cache[hash(crops[1].tobytes())] = ntext
@@ -979,18 +990,21 @@ class App:
                     self.say("Loading the text reader (first scan only, a few seconds)...")
                 t = time.time()
                 lines, items, rects, src, mark_box = [], [], [], img, box
+                all_grey = False
                 if box and box is self.shop_box and self.rows:
                     items = read_rows(img, self.rows, worth=self.worth)  # fast: known rows, cached text
-                if not items:
+                    all_grey = not items and last_faded > 0
+                if not items and not all_grey:  # (a page of only greyed-out rows: done)
                     lines = ocr(img)
                     items = find_shop_items(lines)
                     if box and box is self.shop_box and items:
                         self.rows = shop_rows(lines)
-                        items = read_rows(img, self.rows, seed=True, worth=self.worth) or items
+                        got = read_rows(img, self.rows, seed=True, worth=self.worth)
+                        items = got if got or last_faded else items
                 rects = [it[3] for it in items if len(it) == 5]
                 items = [(it[0], it[1], it[2], it[-1]) for it in items]
                 img_origin = origin
-                if not items and (not self.shop_box or not auto):
+                if not items and not all_grey and (not self.shop_box or not auto):
                     # not a player shop here: read the whole screen (shop moved, or an NPC shop)
                     src = grab()
                     lines, img_origin = ocr(src), full
@@ -1021,6 +1035,9 @@ class App:
                             items = [(it[0], it[1], it[2], it[4]) for it in got]
                             rects = [it[3] for it in got]
                             self.scanned = sub  # the loop now only rescans when the list changes
+                        elif last_faded:
+                            items, rects = [], []  # everything on this page is greyed out
+                            self.scanned = sub
                         else:
                             self.rows = []
                     self.shop_box = nb
@@ -1028,7 +1045,7 @@ class App:
                 elif box and not items and not auto:
                     self.shop_box = None
                 # a row hidden (mouse cursor, tooltip): re-read as soon as anything moves
-                self.incomplete = bool(self.rows) and len(items) < len(self.rows)
+                self.incomplete = bool(self.rows) and len(items) + last_faded < len(self.rows)
                 # the list itself is only touched on the window's thread (no races with it)
                 self.root.after(0, self.apply_scan, items, rects, mark_box, auto, time.time() - t)
             except Exception as e:
