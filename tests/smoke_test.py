@@ -53,7 +53,8 @@ mf.App.overlaps_me = lambda self, box: False
 
 app = mf.App()
 app.cfg["seen_help"] = True
-app.prices = {"Iron Ore": 20}
+app.prices = {"Iron Ore": 20, "Octopus Leg": 12}
+app.names = sorted(app.prices)
 fails = []
 
 
@@ -95,6 +96,14 @@ def script():
         if not ok:
             print("    got ", sorted(mf.norm(n) for n in raw_names()))
             print("    want", sorted(want[i]))
+    # a flip: buy Octopus Leg (shop 1 sells it for 30), sell it to an NPC for 12
+    current["img"] = screens[0]
+    wait_for(lambda: any(v[0] == "Octopus Leg" for v in app.seen.values()), 15, "back on shop 1")
+    for m in (100000, 100000 - 30, 100000 - 30 + 12):
+        app.root.after(0, app.on_mesos, m)
+        time.sleep(0.3)
+    wait_for(lambda: len(app.stats["flips"]) == 1 and not app.bought, 5, "flip recorded from mesos changes")
+    print("   ", app.stats["flips"], "|", app.stats_lbl.cget("text"))
     log = os.path.join(os.environ["LOCALAPPDATA"], "MapleFlipper", "error_log.txt")
     if os.path.exists(log):
         fails.append("errors logged")

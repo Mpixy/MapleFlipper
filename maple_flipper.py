@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.30"
+VERSION = "0.31"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -35,6 +35,9 @@ CUSTOM_FILE = os.path.join(DATA, "custom_prices.txt")
 CONFIG_FILE = os.path.join(DATA, "config.json")
 LOG_FILE = os.path.join(DATA, "mesos_log.csv")
 LEARN_FILE = os.path.join(DATA, "learned.json")
+STATS_FILE = os.path.join(DATA, "flips.json")
+REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
+REPO_SOURCE = "https://raw.githubusercontent.com/Mpixy/MapleFlipper/main/maple_flipper.py"
 BUNDLED_PRICES = os.path.join(getattr(sys, "_MEIPASS", HERE), "prices.json")
 ITEM_URL = "https://meowdb.com/msclassic/item-db/{}"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -480,6 +483,10 @@ TRACK YOUR MESOS
 With 'Auto' on you don't need F8 at all: the app notices when you open
 a player shop and scans it, and rescans when you scroll.
 
+FLIPS
+The tracker shows what you bought and still have to sell, and counts
+your profit per flip (today and all time).
+
 THE APP LEARNS
 - With mesos tracking on, buy an item and sell it to an NPC: the app checks
   the real price. If it was wrong, it fixes it for next time (marked ✓).
@@ -510,7 +517,9 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.report_callback_exception = lambda *exc: log_error(*exc)
         self.learned = Learned()
-        self.bought = []  # (item, text read, qty, expected NPC value) bought this session, waiting to be sold
+        self.stats = load_json(STATS_FILE, {"flips": [], "to_sell": []})
+        # bought from player shops, waiting to be sold: [item, text read, qty, expected NPC value, paid]
+        self.bought = self.stats["to_sell"]
         self.shop_box = None
         self.scanned = None
         self.rows = []
@@ -525,6 +534,7 @@ class App:
         self.mesos = self.start_mesos = None
         self.busy = self.updating = False
         self.build_ui()
+        self.show_stats()
         self.root.bind_all("<F8>", lambda e: self.scan())
         self.start_hotkey()
         threading.Thread(target=self.auto_loop, daemon=True).start()
@@ -532,6 +542,8 @@ class App:
             self.root.after(300, self.update_db)
         else:
             self.say(f"Ready - {len(self.prices):,} item prices loaded. Open a player shop and press F8.")
+        if not getattr(sys, "frozen", False) and not os.path.isdir(os.path.join(HERE, ".git")):
+            self.root.after(3000, self.check_update)
         if self.cfg.get("tracking") and self.cfg.get("meso_area"):
             self.root.after(800, self.toggle_track)  # was tracking last time: keep going
         if not self.cfg.get("seen_help"):
@@ -552,8 +564,10 @@ class App:
         self.log.pack(fill="x", padx=4, pady=(0, 4))
         style = ttk.Style()
         style.configure("Big.TButton", font=("Segoe UI", 14, "bold"), padding=10)
-        ttk.Label(r, text=f"v{VERSION}", font=("Segoe UI", 9, "bold"),
-                  foreground="#666").pack(anchor="w", padx=8, pady=(4, 0))
+        top = ttk.Frame(r)
+        top.pack(fill="x", padx=8, pady=(4, 0))
+        ttk.Label(top, text=f"v{VERSION}", font=("Segoe UI", 9, "bold"), foreground="#666").pack(side="left")
+        self.update_btn = ttk.Button(top, text="", command=self.self_update)  # shown when there is one
         ttk.Button(r, text="🔍  SCAN THIS PAGE  (F8)", style="Big.TButton",
                    command=self.scan).pack(fill="x", padx=8, pady=(8, 4))
 
@@ -600,7 +614,11 @@ class App:
         self.track_btn.pack(side="left", padx=6)
         self.meso_lbl = ttk.Label(box, font=("Segoe UI", 12, "bold"), text="Mesos: -")
         self.meso_lbl.pack(anchor="w", padx=6)
-        self.hist = tk.Listbox(box, height=6, font=("Consolas", 10))
+        self.tosell_lbl = ttk.Label(box, foreground="#b35c00", wraplength=520)
+        self.tosell_lbl.pack(anchor="w", padx=6)
+        self.stats_lbl = ttk.Label(box, foreground="#555")
+        self.stats_lbl.pack(anchor="w", padx=6)
+        self.hist = tk.Listbox(box, height=4, font=("Consolas", 10))
         self.hist.pack(fill="x", padx=4, pady=4)
 
 
@@ -620,6 +638,43 @@ class App:
             self.log.insert(0, line)
             self.log.delete(200, "end")
         self.root.after(0, ui)
+
+    def check_update(self):
+        """Look for a newer version on GitHub every 20 minutes."""
+        def work():
+            try:
+                src = requests.get(REPO_SOURCE, timeout=15).text
+                m = re.search(r'VERSION = "([\d.]+)"', src)
+                newer = m and tuple(map(int, m.group(1).split("."))) > tuple(map(int, VERSION.split(".")))
+                if newer:
+                    self.root.after(0, lambda: (self.update_btn.config(text=f"⬆ Update to v{m.group(1)}"),
+                                                self.update_btn.pack(side="left", padx=8)))
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(20 * 60 * 1000, self.check_update)
+
+    def self_update(self):
+        """Download the latest version over this one and restart."""
+        import io
+        import zipfile
+        self.say("Updating...")
+        try:
+            z = zipfile.ZipFile(io.BytesIO(requests.get(REPO_ZIP, timeout=60).content))
+            for info in z.infolist():
+                rel = info.filename.split("/", 1)[1] if "/" in info.filename else ""
+                if rel and not info.is_dir():
+                    dest = os.path.join(HERE, rel)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    with open(dest, "wb") as f:
+                        f.write(z.read(info))
+        except Exception as e:
+            log_error(type(e), e, e.__traceback__)
+            self.say(f"Update failed: {e}")
+            return
+        import subprocess
+        subprocess.Popen([sys.executable, os.path.join(HERE, "maple_flipper.py")])
+        self.on_close()
 
     def show_help(self):
         messagebox.showinfo("How to use MapleFlipper", HELP_TEXT)
@@ -977,17 +1032,19 @@ class App:
             for v in self.seen.values():
                 real, raw, qty, price = v
                 if real and price == spent:
-                    self.bought.append((real, raw, qty, self.npc_pays(real, qty)))
+                    self.bought.append([real, raw, qty, self.npc_pays(real, qty), spent])
+                    self.save_stats()
                     self.say(f"Bought '{real}' for {spent:,}. Sell it to an NPC - I'll check the price.")
                     return
             return
         if not self.bought:
             return
-        for i, (item, _, qty, expect) in enumerate(self.bought):
+        for i, (item, _, qty, expect, paid) in enumerate(self.bought):
             if expect == diff:
                 self.bought.pop(i)
                 if item not in self.learned.prices:
                     self.learned.set_price(item, self.unit_price(item))
+                self.record_flip(item, paid, diff)
                 self.say(f"✓ Confirmed: '{item}' sold for {diff:,} exactly as predicted.")
                 self.refresh()
                 return
@@ -995,6 +1052,29 @@ class App:
             self.apply_sale(0, diff)
         else:
             self.ask_which_sold(diff)
+
+    def save_stats(self):
+        save_json(STATS_FILE, self.stats)
+        self.root.after(0, self.show_stats)
+
+    def record_flip(self, item, paid, got):
+        self.stats["flips"].append({"time": time.strftime("%Y-%m-%d %H:%M"), "item": item,
+                                    "paid": paid, "got": got})
+        self.save_stats()
+
+    def show_stats(self):
+        today = time.strftime("%Y-%m-%d")
+        flips = self.stats["flips"]
+        t = [f for f in flips if f["time"].startswith(today)]
+        prof = lambda fs: sum(f["got"] - f["paid"] for f in fs)
+        self.stats_lbl.config(text=f"Flips today: {len(t)}  profit {prof(t):+,}    "
+                                   f"All time: {len(flips)}  profit {prof(flips):+,}")
+        if self.bought:
+            todo = ", ".join(f"{b[0]} (+{b[3] - b[4]:,})" if b[3] is not None else b[0]
+                             for b in self.bought)
+            self.tosell_lbl.config(text=f"To sell to an NPC: {todo}")
+        else:
+            self.tosell_lbl.config(text="To sell to an NPC: nothing")
 
     def learn_npc(self, rows):
         """An NPC shop shows the real price for everything you could sell (and the Buy Back
@@ -1013,9 +1093,10 @@ class App:
                 continue  # a stack (the count on the icon wasn't readable): price matches
             unit = price if (qty <= 1 or npc_value(real, 1, qty) == 1) else round(price / qty)
             # something bought from a player shop under a shorter / wrong name?
-            for i, (b_real, b_raw, b_qty, expect) in enumerate(self.bought):
+            for i, (b_real, b_raw, b_qty, expect, paid) in enumerate(self.bought):
                 if b_real != real and norm(real).startswith(norm(b_raw.rstrip(".… "))):
                     self.bought.pop(i)
+                    self.save_stats()
                     if norm(b_raw) in {norm(n) for n in self.prices}:
                         # the shorter name is a real item too: can't remap it, just warn
                         fixed.append(f"you bought '{real}', not '{b_raw}' (the shop name was cut off)")
@@ -1036,10 +1117,11 @@ class App:
             self.rematch()
 
     def apply_sale(self, i, got):
-        item, _, qty, expect = self.bought.pop(i)
+        item, _, qty, expect, paid = self.bought.pop(i)
         stars = npc_value(item, 1, qty) == 1
         unit = got if stars or qty == 1 else round(got / qty)
         self.learned.set_price(item, unit)
+        self.record_flip(item, paid, got)
         self.say(f"Corrected: '{item}' sold for {got:,}, not {expect:,}. Price fixed for the future.")
         self.refresh()
 
@@ -1048,7 +1130,7 @@ class App:
         top.title("What did you just sell?")
         top.attributes("-topmost", True)
         ttk.Label(top, text=f"You got {got:,} mesos. Which item did you sell?").pack(padx=10, pady=6)
-        for i, (item, _, qty, expect) in enumerate(self.bought):
+        for i, (item, _, qty, expect, paid) in enumerate(self.bought):
             ttk.Button(top, text=f"{item}  (expected {expect:,})",
                        command=lambda i=i: (top.destroy(), self.apply_sale(i, got))).pack(fill="x", padx=10, pady=2)
         ttk.Button(top, text="Something else - ignore", command=top.destroy).pack(pady=8)
