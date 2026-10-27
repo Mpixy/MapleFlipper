@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.18"
+VERSION = "0.19"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -324,7 +324,8 @@ class App:
         self.root = tk.Tk()
         self.root.title(f"MapleFlipper v{VERSION}")
         self.root.attributes("-topmost", True)
-        self.root.geometry("560x620")
+        self.root.geometry("600x760")
+        self.root.minsize(520, 600)
         self.cfg = load_json(CONFIG_FILE, {})
         if self.cfg.get("geometry"):
             self.root.geometry(self.cfg["geometry"])
@@ -351,6 +352,14 @@ class App:
     # ---- UI
     def build_ui(self):
         r = self.root
+        logbox = ttk.LabelFrame(r, text="Activity")
+        logbox.pack(fill="x", side="bottom", padx=8, pady=(0, 6))
+        self.status = ttk.Label(logbox, text="Starting...", anchor="w", padding=3,
+                                font=("Segoe UI", 10, "bold"), foreground="#1a5fb4")
+        self.status.pack(fill="x")
+        self.pbar = ttk.Progressbar(logbox, maximum=1.0)
+        self.log = tk.Listbox(logbox, height=4, font=("Consolas", 9), activestyle="none")
+        self.log.pack(fill="x", padx=4, pady=(0, 4))
         style = ttk.Style()
         style.configure("Big.TButton", font=("Segoe UI", 14, "bold"), padding=10)
         ttk.Label(r, text=f"v{VERSION}", font=("Segoe UI", 9, "bold"),
@@ -398,10 +407,7 @@ class App:
         self.hist = tk.Listbox(box, height=6, font=("Consolas", 10))
         self.hist.pack(fill="x", padx=4, pady=4)
 
-        self.status = ttk.Label(r, text="Ready. Open a player shop and press SCAN (or F8).",
-                                relief="sunken", anchor="w", padding=3)
-        self.status.pack(fill="x", side="bottom")
-        self.pbar = ttk.Progressbar(r, maximum=1.0)
+
 
     def say(self, text, pct=None):
         def ui():
@@ -409,8 +415,14 @@ class App:
             if pct is None:
                 self.pbar.pack_forget()
             else:
-                self.pbar.pack(fill="x", side="bottom", padx=8, pady=2, before=self.status)
+                self.pbar.pack(fill="x", padx=4, pady=2, after=self.status)
                 self.pbar["value"] = pct
+            line = time.strftime("%H:%M:%S  ") + text
+            # progress messages update in place instead of flooding the log
+            if self.log.size() and pct is not None and self.log.get(0)[10:30] == line[10:30]:
+                self.log.delete(0)
+            self.log.insert(0, line)
+            self.log.delete(200, "end")
         self.root.after(0, ui)
 
     def show_help(self):
@@ -459,9 +471,10 @@ class App:
     # ---- shop scan
     def scan(self):
         if self.busy:
+            self.say("Still working on the previous scan - one moment...")
             return
         self.busy = True
-        self.say("Scanning...")
+        self.say("F8 pressed - reading the screen...")
         self.root.attributes("-alpha", 0.0)  # don't OCR our own window
         self.root.update()
         time.sleep(0.1)
@@ -472,6 +485,9 @@ class App:
 
         def work():
             try:
+                if _ocr is None:
+                    self.say("Loading the text reader (first scan only, a few seconds)...")
+                t = time.time()
                 items = find_shop_items(ocr(img))
                 new_good = False
                 for name, qty, price in items:
@@ -487,7 +503,7 @@ class App:
                     winsound.MessageBeep(winsound.MB_ICONASTERISK)
                 self.root.after(0, self.refresh)
                 n_good = sum(1 for v in self.seen.values() if self.profit(v) and self.profit(v) > 0)
-                self.say(f"Found {len(items)} items on screen. Profitable so far: {n_good}. "
+                self.say(f"Scan took {time.time() - t:.1f}s. Found {len(items)} items on screen. Profitable so far: {n_good}. "
                          f"Scroll the shop and scan again for more.")
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
@@ -563,6 +579,8 @@ class App:
             return
         self.tracking = not self.tracking
         self.track_btn.config(text="■ Stop tracking" if self.tracking else "▶ Start tracking")
+        self.say("Mesos tracking started - watching your inventory." if self.tracking
+                 else "Mesos tracking stopped.")
         if self.tracking:
             self.start_mesos = self.mesos = None
             self.hist.delete(0, "end")
@@ -594,11 +612,13 @@ class App:
         self.mesos = v
         if self.start_mesos is None:
             self.start_mesos = v
+            self.say(f"Mesos read: {v:,} - this is the starting point.")
         elif old is not None:
             diff = v - old
             kind = "SOLD to NPC / gained" if diff > 0 else "Spent / bought"
             stamp = time.strftime("%H:%M:%S")
             self.hist.insert(0, f"{stamp}  {diff:+12,}  {kind}")
+            self.say(f"Mesos changed {diff:+,} (now {v:,})")
             new_file = not os.path.exists(LOG_FILE)
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 if new_file:
