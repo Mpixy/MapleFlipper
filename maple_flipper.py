@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "1.6"
+VERSION = "0.15"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -333,6 +333,8 @@ class App:
         r = self.root
         style = ttk.Style()
         style.configure("Big.TButton", font=("Segoe UI", 14, "bold"), padding=10)
+        ttk.Label(r, text=f"v{VERSION}", font=("Segoe UI", 9, "bold"),
+                  foreground="#666").pack(anchor="w", padx=8, pady=(4, 0))
         ttk.Button(r, text="🔍  SCAN SHOP  (F8)", style="Big.TButton",
                    command=self.scan).pack(fill="x", padx=8, pady=(8, 4))
 
