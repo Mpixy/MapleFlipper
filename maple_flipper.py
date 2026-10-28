@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.49"
+VERSION = "0.50"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -312,27 +312,21 @@ def shop_rows(lines):
     return rows
 
 
-def read_price(crop, verify=True):
-    """Read a 'N for X mesos' line, and with verify=True a second time enlarged. OCR sometimes
-    drops a digit ('2,999' -> '299'); the two reads then disagree. Returns (qty, price, sure) or None."""
-    import cv2  # comes with rapidocr
-    reads = []
-    ims = [crop]
-    if verify:
-        ims.append(cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
-    for im in ims:
-        m = PRICE_LINE.search(read_line(np.ascontiguousarray(im)))
-        if m and to_int(m.group(1)) and to_int(m.group(2)):
-            raw = m.group(2).strip(",.")
-            reads.append((to_int(m.group(1)), to_int(raw), bool(GROUPED.match(raw))))
-    if not reads:
+def parse_price(text):
+    """'1 for 2,999 mes0s' -> (qty, price, well_formed) or None."""
+    m = PRICE_LINE.search(text.replace(".,", ",").replace(",.", ","))
+    if not m or not to_int(m.group(1)) or not to_int(m.group(2)):
         return None
-    if not verify or (len(reads) == 2 and reads[0][:2] == reads[1][:2]):
-        return reads[0][0], reads[0][1], reads[0][2]
-    # disagree (or only one read): prefer a well-formed number, then the longer one
-    # (a lost digit is far more common than an invented one) - but don't trust it
-    qty, price, _ = max(reads, key=lambda r: (r[2], r[1]))
-    return qty, price, False
+    raw = m.group(2).strip(",.")
+    return to_int(m.group(1)), to_int(raw), bool(GROUPED.match(raw))
+
+
+def read_price(crop, big=False):
+    """Read a 'N for X mesos' line (big=True: enlarged first - a second opinion)."""
+    if big:
+        import cv2  # comes with rapidocr
+        crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    return parse_price(read_line(np.ascontiguousarray(crop)))
 
 
 def ink_width(crop):
@@ -371,8 +365,9 @@ def width_fits(w, qty, price, ref):
 def read_rows(img, rows, width=320, seed=False, worth=None):
     """Read the shop rows at known places. Returns (name, qty, price, row rect, sure) per row.
     seed=True stores the text the full scan already read, so nothing is read twice.
-    worth(name, qty, price) -> True: only those rows get the slower double-check of the price
-    (rows that aren't worth buying don't need it - that is most of them)."""
+    The price is checked against the width of the line on screen (OCR drops digits:
+    '2,999' -> '299'); rows that would be worth buying get a second, enlarged read too.
+    worth(name, qty, price) -> True marks those rows."""
     global last_faded
     found, last_faded = [], 0
     for (nx, ny, nh, ntext), (px, py, ph, ptext) in rows:
@@ -386,27 +381,53 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
         if seed and ptext is not None:
             _rec_cache[hash(crops[0].tobytes())] = ptext
             _rec_cache[hash(crops[1].tobytes())] = ntext
-        got = read_price(crops[0], verify=worth is None)
+        got = read_price(crops[0])
         if not got:
-            continue  # empty slot / tooltip in the way
+            got = read_price(crops[0], big=True)
+            if not got:
+                continue  # empty slot / tooltip in the way
         name = read_line(crops[1])
         if re.search(r"[A-Za-z]{2}", name):
             rect = (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4))
-            found.append((name, got, crops[0], rect, ink_width(crops[0])))
+            found.append((name, got, crops, rect, ink_width(crops[0])))
     # how wide one character is: the median over this page and earlier pages
-    here = [w / len(f"{q} for {p:,} mesos") for _, (q, p, sure), _, _, w in found if w and sure]
-    ref = float(np.median(_char_px + here)) if len(_char_px + here) >= 3 else None
+    here = [w / len(f"{q} for {p:,} mesos") for _, (q, p, _), _, _, w in found if w]
+    ref = float(np.median(_char_px[-30:] + here)) if len(_char_px + here) >= 3 else None
     items = []
-    for name, (qty, cost, sure), crop, rect, w in found:
+    for name, (qty, cost, formed), crops, rect, w in found:
         fits = width_fits(w, qty, cost, ref)
-        if worth and (not sure or not fits or worth(name, qty, cost)):
-            qty, cost, sure = read_price(crop) or (qty, cost, sure)
-            fits = width_fits(w, qty, cost, ref)
-        items.append((name, qty, cost, rect, sure and fits))
-        if w and sure and fits:
+        sure = formed and fits and ref is not None
+        if not sure or (worth and worth(name, qty, cost)):
+            alt = read_price(crops[0], big=True)
+            if alt and alt[:2] != (qty, cost):
+                alt_fits = width_fits(w, alt[0], alt[1], ref)
+                if alt_fits and alt[2] and not (fits and formed):
+                    (qty, cost, formed), fits, sure = alt, True, ref is not None
+                elif alt_fits and fits:
+                    sure = False  # two different readings that both look right: check it
+            elif ref is None and alt and alt[:2] == (qty, cost):
+                sure = formed  # no width yet: two identical reads will do
+        if match_hint(name) is False:  # unknown name: maybe a letter was lost - read it bigger
+            name2 = read_line(np.ascontiguousarray(_big(crops[1])))
+            if name2 and match_hint(name2):
+                name = name2
+        items.append((name, qty, cost, rect, sure))
+        if w and fits and formed:
             _char_px.append(w / len(f"{qty} for {cost:,} mesos"))
     del _char_px[:-60]
     return items
+
+
+def _big(crop):
+    import cv2
+    return cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+
+name_check = None  # set by the app: name -> True (known item) / False (unknown)
+
+
+def match_hint(name):
+    return name_check(name) if name_check else None
 
 
 def grab(region=None):
@@ -600,7 +621,7 @@ def match_name(name, names, learned=None):
         return (by_key[pre.pop()], 95) if len(pre) == 1 else (None, 0)
     if key in by_key:
         return by_key[key], 100
-    allowed = 2 if len(key) >= 15 else 1
+    allowed = 3 if len(key) >= 18 else 2 if len(key) >= 10 else 1  # 'Single aring' = Single Earring
     close = [(Levenshtein.distance(key, k), k) for k in by_key
              if abs(len(k) - len(key)) <= allowed]
     close = sorted(c for c in close if c[0] <= allowed)
@@ -740,6 +761,8 @@ class App:
         self.busy_since = 0.0
         self.prices = load_prices()
         self.wild = self.learned.drop_wild(self.prices)
+        global name_check
+        name_check = lambda n: match_name(n, self.names, self.learned)[0] is not None  # noqa: E731
         self.names = sorted(set(self.prices) | set(self.learned.prices))
         self.seen = {}
         self.seen_shop = {}  # item key -> seller name
