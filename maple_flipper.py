@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.51"
+VERSION = "0.52"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -77,6 +77,97 @@ def log_error(etype, value, tb):
 
 sys.excepthook = log_error
 threading.excepthook = lambda a: log_error(a.exc_type, a.exc_value, a.exc_traceback)
+
+
+# ---------------------------------------------------------------- debug log (for Claude, not shown)
+# Everything the app saw and decided goes to debug/log.jsonl (+ small pictures of the shop list
+# in debug/shots). 'Save debug zip' packs it up, so a complaint can be traced exactly.
+DEBUG_DIR = os.path.join(DATA, "debug")
+SHOTS_DIR = os.path.join(DEBUG_DIR, "shots")
+os.makedirs(SHOTS_DIR, exist_ok=True)
+_dlock = threading.Lock()
+
+
+def dlog(kind, **data):
+    try:
+        line = json.dumps({"t": time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}",
+                           "d": time.strftime("%Y-%m-%d"), "k": kind, **data},
+                          ensure_ascii=False, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+        path = os.path.join(DEBUG_DIR, "log.jsonl")
+        with _dlock:
+            if os.path.exists(path) and os.path.getsize(path) > 8_000_000:
+                os.replace(path, os.path.join(DEBUG_DIR, "log.old.jsonl"))
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+    except Exception:
+        pass  # logging must never break the app
+
+
+def save_shot(tag, img, keep=200):
+    """A small JPEG of what was read, named by time, so a log line can be matched to a picture."""
+    try:
+        import cv2
+        name = time.strftime("%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}-{tag}.jpg"
+        cv2.imwrite(os.path.join(SHOTS_DIR, name), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        files = sorted(os.listdir(SHOTS_DIR))
+        for old in files[:-keep]:
+            os.remove(os.path.join(SHOTS_DIR, old))
+        return name
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- memory (learns as you play)
+MEMORY_FILE = os.path.join(DATA, "memory.json")
+
+
+def pix_key(img):
+    import hashlib
+    return hashlib.md5(img.tobytes() + str(img.shape).encode()).hexdigest()[:20]
+
+
+class Memory:
+    """What the app has seen before, by exact pixels - the game draws the same price text and
+    the same item icon identically every time, so once read for sure, it is known for good:
+    price: picture of a 'N for X mesos' line -> (N, X)  (no OCR, no doubt next time)
+    icon:  picture of an item icon -> votes for its name  (beats a misread name)
+    bought: item -> how often you bought it  (those are always read extra carefully)"""
+
+    def __init__(self):
+        d = load_json(MEMORY_FILE, {})
+        self.price = d.get("price", {})
+        self.icon = d.get("icon", {})
+        self.bought = d.get("bought", {})
+        self.dirty, self.saved = False, time.time()
+
+    def icon_name(self, key):
+        votes = self.icon.get(key) if key else None
+        if not votes:
+            return None
+        name, n = max(votes.items(), key=lambda kv: kv[1])
+        return name if n >= 3 and n >= 0.8 * sum(votes.values()) else None
+
+    def learn_icon(self, key, name):
+        if key:
+            v = self.icon.setdefault(key, {})
+            v[name] = min(v.get(name, 0) + 1, 50)
+            self.dirty = True
+
+    def learn_price(self, key, qty, price):
+        if self.price.get(key) != [qty, price]:
+            self.price[key] = [qty, price]
+            self.dirty = True
+
+    def save(self, force=False):
+        if self.dirty and (force or time.time() - self.saved > 30):
+            for dct in (self.price, self.icon):
+                while len(dct) > 30000:
+                    dct.pop(next(iter(dct)))
+            save_json(MEMORY_FILE, {"price": self.price, "icon": self.icon, "bought": self.bought})
+            self.dirty, self.saved = False, time.time()
+
+
+MEM = None  # created by the app (after the data folder exists)
 
 
 # ---------------------------------------------------------------- price database
@@ -365,10 +456,13 @@ def width_fits(w, qty, price, ref):
 def read_rows(img, rows, width=320, seed=False, worth=None):
     """Read the shop rows at known places. Returns (name, qty, price, row rect, sure) per row.
     seed=True stores the text the full scan already read, so nothing is read twice.
-    The price is checked against the width of the line on screen (OCR drops digits:
-    '2,999' -> '299'); rows that would be worth buying get a second, enlarged read too.
-    worth(name, qty, price) -> True marks those rows."""
+    1. Pictures seen before (memory): price / name known at once, no OCR.
+    2. The price is checked against the width of the line on screen (OCR drops digits:
+       '2,999' -> '299'); doubtful rows get more tries (bigger, black on white) right away,
+       instead of you pressing F8 again and again.
+    worth(name, qty, price) -> True: rows worth buying, always double-checked."""
     global last_faded
+    t0 = time.time()
     found, last_faded = [], 0
     for (nx, ny, nh, ntext), (px, py, ph, ptext) in rows:
         if min(nx, ny, px, py) < 0 or ny + nh > img.shape[0] or py + ph > img.shape[0]:
@@ -381,41 +475,90 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
         if seed and ptext is not None:
             _rec_cache[hash(crops[0].tobytes())] = ptext
             _rec_cache[hash(crops[1].tobytes())] = ntext
-        got = read_price(crops[0])
-        if not got:
-            got = read_price(crops[0], big=True)
+        pkey = pix_key(crops[0])
+        mem = MEM.price.get(pkey) if MEM else None
+        if mem:
+            got, ptxt = (mem[0], mem[1], True), "memory"
+        else:
+            ptxt = read_line(crops[0])
+            got = parse_price(ptxt) or read_price(crops[0], big=True)
             if not got:
                 continue  # empty slot / tooltip in the way
-        name = read_line(crops[1])
+        icon = img[ny + 2:ny + 34, nx - 62:nx - 16] if nx >= 62 else None
+        ikey = pix_key(np.ascontiguousarray(icon)) if icon is not None and icon.size else None
+        iname = MEM.icon_name(ikey) if MEM else None
+        name = iname or read_line(crops[1])
         if re.search(r"[A-Za-z]{2}", name):
             rect = (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4))
-            found.append((name, got, crops, rect, ink_width(crops[0])))
+            found.append((name, got, crops, rect, ink_width(crops[0]), pkey, bool(mem), ikey, iname, ptxt))
     # how wide one character is: the median over this page and earlier pages
-    here = [w / len(f"{q} for {p:,} mesos") for _, (q, p, _), _, _, w in found if w]
+    here = [w / len(f"{q} for {p:,} mesos") for _, (q, p, _), _, _, w, *_ in found if w]
     ref = float(np.median(_char_px[-30:] + here)) if len(_char_px + here) >= 3 else None
     items = []
-    for name, (qty, cost, formed), crops, rect, w in found:
-        fits = width_fits(w, qty, cost, ref)
-        sure = formed and fits and ref is not None
-        if not sure or (worth and worth(name, qty, cost)):
-            alt = read_price(crops[0], big=True)
-            if alt and alt[:2] != (qty, cost):
-                alt_fits = width_fits(w, alt[0], alt[1], ref)
-                if alt_fits and alt[2] and not (fits and formed):
-                    (qty, cost, formed), fits, sure = alt, True, ref is not None
-                elif alt_fits and fits:
-                    sure = False  # two different readings that both look right: check it
-            elif ref is None and alt and alt[:2] == (qty, cost):
-                sure = formed  # no width yet: two identical reads will do
-        if match_hint(name) is False:  # unknown name: maybe a letter was lost - read it bigger
-            name2 = read_line(np.ascontiguousarray(_big(crops[1])))
-            if name2 and match_hint(name2):
-                name = name2
+    for name, (qty, cost, formed), crops, rect, w, pkey, from_mem, ikey, iname, ptxt in found:
+        tries = []
+        if from_mem:
+            fits = sure = True
+        else:
+            fits = width_fits(w, qty, cost, ref)
+            sure = formed and fits and ref is not None
+            if not sure or (worth and worth(name, qty, cost)):
+                for how in ("big", "big3", "bw"):  # more ways to read it, until one fits
+                    alt = read_variant(crops[0], how)
+                    tries.append((how, alt and alt[:2]))
+                    if not alt:
+                        continue
+                    alt_fits = width_fits(w, alt[0], alt[1], ref)
+                    if alt[:2] == (qty, cost):
+                        if ref is None:
+                            sure = formed  # no width yet: two identical reads will do
+                        if sure:
+                            break
+                        continue
+                    if alt_fits and alt[2] and not (fits and formed):
+                        (qty, cost, formed), fits, sure = alt, True, ref is not None
+                        break
+                    if alt_fits and fits:
+                        sure = False  # two different readings that both look right: check it
+                        break
+                    if sure:
+                        break
+        if not iname and match_hint(name) is False:  # unknown name: try harder
+            for how in ("big", "big3", "bw"):
+                name2 = read_variant(crops[1], how, text=True)
+                tries.append(("name-" + how, name2))
+                if name2 and match_hint(name2):
+                    name = name2
+                    break
         items.append((name, qty, cost, rect, sure))
-        if w and fits and formed:
+        if w and fits and formed and not from_mem:
             _char_px.append(w / len(f"{qty} for {cost:,} mesos"))
+        if MEM and sure and not from_mem:
+            MEM.learn_price(pkey, qty, cost)
+        real, score = matcher(name) if matcher else (None, 0)
+        if MEM and real and score == 100 and sure:
+            MEM.learn_icon(ikey, real)
+        dlog("row", name=name, icon_name=iname, real=real, score=score, price_text=ptxt, qty=qty,
+             price=cost, sure=bool(sure), width=w, char_px=round(ref, 2) if ref else None,
+             mem=from_mem, tries=tries)
     del _char_px[:-60]
+    dlog("rows", n=len(items), faded=last_faded, ms=int((time.time() - t0) * 1000))
     return items
+
+
+def read_variant(crop, how, text=False):
+    """Other ways to read the same line: enlarged 2x / 3x, or black-on-white."""
+    import cv2
+    if how == "big":
+        im = _big(crop)
+    elif how == "big3":
+        im = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    else:
+        g = cv2.cvtColor(_big(crop), cv2.COLOR_BGR2GRAY)
+        _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        im = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    t = read_line(np.ascontiguousarray(im))
+    return t if text else parse_price(t)
 
 
 def _big(crop):
@@ -424,6 +567,7 @@ def _big(crop):
 
 
 name_check = None  # set by the app: name -> True (known item) / False (unknown)
+matcher = None  # set by the app: name -> (item, score)
 
 
 def match_hint(name):
@@ -720,6 +864,7 @@ WATCH LIST
 Purple frame + sound when one is in a shop, profitable or not.
 
 KEYS: F8 scan · F9 mini/full window · F10 clear the list
+     F11 "this is wrong!" - saves the moment for Claude ('Debug zip' sends it)
 '⟳ Restart' if the app ever gets stuck - nothing is lost.
 
 Orange '(?)' = no price known for that item.
@@ -761,8 +906,12 @@ class App:
         self.busy_since = 0.0
         self.prices = load_prices()
         self.wild = self.learned.drop_wild(self.prices)
-        global name_check
+        global name_check, matcher, MEM
         name_check = lambda n: match_name(n, self.names, self.learned)[0] is not None  # noqa: E731
+        matcher = lambda n: match_name(n, self.names, self.learned)  # noqa: E731
+        MEM = Memory()
+        dlog("start", version=VERSION, prices=len(self.prices), learned=len(self.learned.prices),
+             memory_prices=len(MEM.price), memory_icons=len(MEM.icon))
         self.names = sorted(set(self.prices) | set(self.learned.prices))
         self.seen = {}
         self.seen_shop = {}  # item key -> seller name
@@ -859,6 +1008,7 @@ class App:
         ttk.Button(bar, text="Stats", command=self.stats_window).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="👀 Watch", command=self.watch_dialog).pack(side="right", padx=(0, 6))
         ttk.Button(top, text="⟳ Restart", command=self.restart).pack(side="right")
+        ttk.Button(top, text="Debug zip", command=self.debug_zip).pack(side="right", padx=4)
 
         cols = ("item", "qty", "price", "npc", "profit", "shop")
         self.tree = ttk.Treeview(r, columns=cols, show="headings", height=14)
@@ -897,6 +1047,8 @@ class App:
 
 
     def say(self, text, pct=None):
+        if pct is None:
+            dlog("say", text=text)
         def ui():
             self.status.config(text=text)
             if self.mini:
@@ -1004,7 +1156,7 @@ class App:
                     if not same_shop:
                         self.root.after(0, self.new_shop, sig)
                     self.say(f"Shop of {sig or '?'} - reading it...")
-                    lay = self.cfg.get("layout")
+                    lay = self.cfg.get("layout2")
                     if lay:  # every shop window looks the same: read the rows right away
                         self.shop_box = {"left": x + lay["dx"], "top": y + lay["dy"],
                                          "width": lay["w"], "height": lay["h"]}
@@ -1013,8 +1165,8 @@ class App:
                         self.root.after(0, self.scan, True, self.shop_box)
                     else:
                         # just the item list (left half, under the buttons): less to read = faster
-                        cand = {"left": max(x - 330, mon["left"]), "top": max(y + 80, mon["top"]),
-                                "width": 490, "height": 520}
+                        cand = {"left": max(x - 420, mon["left"]), "top": max(y + 80, mon["top"]),
+                                "width": 580, "height": 520}
                         self.root.after(0, self.scan, True, cand)
                     last = None
                     continue
@@ -1047,7 +1199,7 @@ class App:
         """Poll the real key state: works even when the game swallows the key press."""
         def loop():
             user32 = ctypes.windll.user32
-            was_down = was9 = was10 = False
+            was_down = was9 = was10 = was11 = False
             while True:
                 down = bool(user32.GetAsyncKeyState(0x77) & 0x8000)  # VK_F8
                 if down and not was_down:
@@ -1062,6 +1214,10 @@ class App:
                     self.root.after(0, self.clear)
                     self.say("List cleared (F10).")
                 was10 = d10
+                d11 = bool(user32.GetAsyncKeyState(0x7A) & 0x8000)  # VK_F11: "this is wrong!"
+                if d11 and not was11:
+                    self.root.after(0, self.complain)
+                was11 = d11
                 time.sleep(0.03)
         threading.Thread(target=loop, daemon=True).start()
 
@@ -1143,7 +1299,7 @@ class App:
                     if self.layout_try:
                         self.layout_try = False
                         if not items and not all_grey:  # saved layout doesn't fit this window
-                            self.cfg.pop("layout", None)
+                            self.cfg.pop("layout2", None)
                             self.shop_box, self.rows, self.redetect = None, [], True
                             self.busy = False
                             return
@@ -1172,8 +1328,9 @@ class App:
                     y0 = min(o["y"] for o in prices_l) + img_origin["top"]
                     y1 = max(o["y"] for o in prices_l) + img_origin["top"]
                     # only the text columns: the map behind/next to the window keeps moving
-                    nb = {"left": int(max(x0 - 12, full["left"])), "top": int(max(y0 - 55, full["top"])),
-                          "width": 340, "height": int(y1 - y0 + 75)}
+                    # the text columns + the item icons (the app learns items by their icon)
+                    nb = {"left": int(max(x0 - 92, full["left"])), "top": int(max(y0 - 55, full["top"])),
+                          "width": 420, "height": int(y1 - y0 + 75)}
                     # reuse this scan for the list area: row positions + text, no second scan
                     dx, dy = img_origin["left"] - nb["left"], img_origin["top"] - nb["top"]
                     sx, sy = -dx, -dy
@@ -1190,7 +1347,7 @@ class App:
                             self.scanned = sub  # the loop now only rescans when the list changes
                             b = self.shop_btn_abs
                             if b and len(self.rows) >= 5:  # a full window: remember its layout
-                                self.cfg["layout"] = {"dx": nb["left"] - b[0], "dy": nb["top"] - b[1],
+                                self.cfg["layout2"] = {"dx": nb["left"] - b[0], "dy": nb["top"] - b[1],
                                                       "w": nb["width"], "h": nb["height"],
                                                       "rows": [[list(a[:3]) for a in row] for row in self.rows]}
                         elif last_faded:
@@ -1205,7 +1362,17 @@ class App:
                 # a row hidden (mouse cursor, tooltip): re-read as soon as anything moves
                 self.incomplete = bool(self.rows) and len(items) + last_faded < len(self.rows)
                 # the list itself is only touched on the window's thread (no races with it)
-                self.root.after(0, self.apply_scan, items, rects, mark_box, auto, time.time() - t)
+                took = time.time() - t
+                shot = None
+                if items and box:
+                    sig = tuple(it[:3] for it in items)
+                    if sig != getattr(self, "last_shot_sig", None):  # a new page: keep a picture
+                        self.last_shot_sig = sig
+                        shot = save_shot("page", img)
+                dlog("scan", auto=auto, shop=self.cur_shop, ms=int(took * 1000), items=len(items),
+                     fast=bool(box and box is self.shop_box and not lines), layout=bool(self.cfg.get("layout2")),
+                     shot=shot)
+                self.root.after(0, self.apply_scan, items, rects, mark_box, auto, took)
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
                 self.say(f"Scan failed: {e}")
@@ -1225,6 +1392,8 @@ class App:
     def worth(self, name, qty, price):
         """Would this row show up as profitable? (only those get their price double-checked)"""
         real, _ = match_name(name, self.names, self.learned)
+        if real and MEM and real in MEM.bought:
+            return True  # you buy these: always read them twice
         pays = self.npc_pays(real, qty) if real else None
         return pays is None or pays - price > 0
 
@@ -1279,6 +1448,15 @@ class App:
             if rects and (good or watched):
                 marks.append((rects[i], p if good else None))
         self.count.update(page)
+        for name, qty, price, sure in items:
+            real, score = match_name(name, self.names, self.learned)
+            key = (real or name, price)
+            v = self.seen.get(key)
+            dlog("item", shop=self.cur_shop, read=name, item=real, score=score, qty=qty, price=price,
+                 sure=bool(sure) and key not in self.unsure, pays=self.npc_pays(real, qty) if real else None,
+                 profit=self.profit(v) if v else None, odd=key in self.odd_name, watched=self.watched(real or name))
+        if MEM:
+            MEM.save()
         # the same page again with an item missing from the middle: it was bought (by you or
         # someone else). Missing at the top / bottom is just scrolling.
         gone = {k for k in prev_page - self.on_page if k in prev_order[1:-1]}
@@ -1330,6 +1508,9 @@ class App:
         self.root.after(250, self.flash, n - 1)
 
     def set_banner(self, text, bg, fg):
+        if text != getattr(self, "last_banner", None):
+            self.last_banner = text
+            dlog("banner", text=text)
         self.banner.config(text=text, bg=bg, fg=fg)
         if self.mini:
             self.mini_deal.config(text=text, bg=bg, fg=fg)
@@ -1402,6 +1583,39 @@ class App:
             save_json(CONFIG_FILE, self.cfg)
             self.refresh()
             self.say(f"👀 Watching '{item}' from now on.")
+
+    def complain(self):
+        """F11: something looks wrong right now - keep a full screenshot and mark the log, so
+        Claude can see exactly this moment."""
+        try:
+            shot = save_shot("F11", grab()[:, :, :3], keep=400)
+        except Exception:
+            shot = None
+        dlog("F11", shot=shot, banner=self.banner.cget("text"), shop=self.cur_shop,
+             rows=[self.tree.item(i, "values") for i in self.tree.get_children()][:40])
+        self.say(f"📌 Saved this moment ({time.strftime('%H:%M:%S')}) - tell Claude what was wrong.")
+
+    def debug_zip(self):
+        """Pack the debug log + pictures into one zip on the Desktop, ready to send."""
+        import zipfile
+        desk = os.path.join(os.path.expanduser("~"), "Desktop")
+        out = os.path.join(desk if os.path.isdir(desk) else DATA, time.strftime("MapleFlipper-debug-%m%d-%H%M.zip"))
+        if MEM:
+            MEM.save(force=True)
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            for folder, _, files in os.walk(DEBUG_DIR):
+                for fn in files:
+                    p = os.path.join(folder, fn)
+                    z.write(p, os.path.relpath(p, DATA))
+            for fn in ("error_log.txt", "config.json", "learned.json", "flips.json"):
+                p = os.path.join(DATA, fn)
+                if os.path.exists(p):
+                    z.write(p, fn)
+        self.say(f"Debug zip saved: {out}")
+        try:
+            os.startfile(os.path.dirname(out))  # Windows: show it
+        except Exception:
+            pass
 
     def restart(self):
         """Stuck or acting weird: start the app again (keeps everything it learned)."""
@@ -1575,6 +1789,10 @@ class App:
                 self.seen[key] = v
                 self.seen_shop.setdefault(key, self.cur_shop)
             self.bought_keys[key] = spent
+            dlog("bought", item=real, read=raw, shop_price=price, paid=spent)
+            if MEM:
+                MEM.bought[real] = MEM.bought.get(real, 0) + 1
+                MEM.dirty = True
             if self.seen_shop.get(key):
                 self.stats.setdefault("from", {})[real] = self.seen_shop[key]
             pays = self.npc_pays(real, qty)
@@ -1622,6 +1840,7 @@ class App:
 
     def record_flip(self, item, paid, got):
         seller = self.stats.setdefault("from", {}).pop(item, "")
+        dlog("flip", item=item, paid=paid, got=got)
         self.stats["flips"].append({"time": time.strftime("%Y-%m-%d %H:%M"), "item": item,
                                     "paid": paid, "got": got, "shop": seller})
         self.session_flips += got - paid
@@ -1838,7 +2057,7 @@ class App:
             except Exception:
                 pass
             self.overlay = ov
-        pad = 70  # rows start left of the watched text area (item icons)
+        pad = 70  # (the overlay starts a bit left of the watched area)
         w = box["width"] + pad + 140
         self.overlay.geometry(f"{w}x{box['height']}+{box['left'] - pad}+{box['top']}")
         self.overlay.deiconify()
@@ -1883,6 +2102,9 @@ class App:
                         geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
                         auto=self.auto.get(), mini=self.mini_on)
         self.save_shop()
+        if MEM:
+            MEM.save(force=True)
+        dlog("close")
         if self.mini:
             self.cfg["mini_pos"] = [self.mini.winfo_x(), self.mini.winfo_y()]
         save_json(CONFIG_FILE, self.cfg)
@@ -1899,6 +2121,7 @@ class App:
         if not deals:
             return False
         p, v = max(deals, key=lambda x: x[0])
+        dlog("missed", shop=shop, item=v[0], price=v[3], profit=p, n=len(deals))
         self.say(f"⚠ You left {shop} without buying {v[0]} (+{p:,})!")
         self.set_banner(f"⚠ MISSED at {shop}: {v[0]} for {v[3]:,} → +{p:,}" +
                         (f"  (+{len(deals) - 1} more)" if len(deals) > 1 else "") + " - go back?", "#ff3b3b", "#fff")
@@ -1911,6 +2134,7 @@ class App:
         """Another shop: drop the losers of the previous ones, keep the profitable items
         until they are bought."""
         missed = self.left_shop()
+        dlog("shop", seller=seller, revisit=bool(self.known_shop(seller)))
         for key, v in list(self.seen.items()):
             p = self.profit(v)
             if (p is None or p <= 0 or p < self.min_p() or key in self.unsure) and key not in self.bought_keys:
@@ -2050,6 +2274,7 @@ class App:
             kind = "SOLD to NPC / gained" if diff > 0 else "Spent / bought"
             stamp = time.strftime("%H:%M:%S")
             self.hist.insert(0, f"{stamp}  {diff:+12,}  {kind}")
+            dlog("mesos", old=old, new=v, diff=diff)
             self.learn_from_mesos(diff)  # says something only when it is a buy / sale it recognises
             new_file = not os.path.exists(LOG_FILE)
             with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -2120,6 +2345,7 @@ class App:
             mm.add_command(label="Your flips (stats)...", command=self.stats_window)
             mm.add_command(label="👀 Watch list...", command=self.watch_dialog)
             mm.add_command(label="⟳ Restart the app", command=self.restart)
+            mm.add_command(label="Save debug zip (for Claude)", command=self.debug_zip)
             mm.add_separator()
             mm.add_command(label="Quit", command=self.on_close)
             mm.tk_popup(e.x_root, e.y_root)
