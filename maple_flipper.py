@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.50"
+VERSION = "0.51"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -776,6 +776,7 @@ class App:
         self.count = {}  # item key -> how many identical rows the shop page has (Lemona ×2)
         self.watch = self.cfg.get("watch", [])  # item names (or parts) to always tell you about
         self.watch_seen = set()
+        self.odd_name = set()  # keys whose name looked suspicious (see apply_scan)
         self.session_flips = 0  # profit of the flips finished since the app started
         self.revisit = None  # (when, best profit) of the current shop's last visit
         self.tracking = False
@@ -977,6 +978,7 @@ class App:
                         misses = 0
                         self.shop_box, last, tried = None, None, None
                         self.root.after(0, self.hide_marks)
+                        self.root.after(0, self.left_shop)
                         self.say("Shop closed - waiting for the next shop.")
                         continue
                 if not box:  # no shop known: look for one (cheap colour check, no OCR)
@@ -1024,8 +1026,6 @@ class App:
                 img = grab(box)
             except Exception:
                 continue
-            if last is not None and changed(img, last, 0.01) and getattr(self, "overlay", None):
-                self.root.after(0, self.hide_marks)  # scrolling / bought: old frames would point at wrong rows
             # the list stopped moving and shows something we haven't read yet -> scan it
             if not changed(img, last, 0.01) and changed(img, self.scanned, 0 if self.incomplete else 0.02):
                 screen = grab()
@@ -1251,6 +1251,13 @@ class App:
                 key = next((k for k in self.seen if k[1] == price and not self.seen[k][0]
                             and Levenshtein.distance(norm(k[0]), norm(name)) <= 2), key)
             v = (real, name, qty, price)
+            pays = self.npc_pays(real, qty) if real else None
+            if sure and pays and pays >= 4 * price and pays - price >= 2000 and (
+                    score < 100 or len(norm(real)) <= 4):
+                # a huge deal on a short / not-quite-matching name: the mouse cursor over 'Saw'
+                # made it 'Sai' (13,500). Too good to trust without a look.
+                sure = False
+                self.odd_name.add(key)
             if sure:
                 self.unsure.discard(key)
             else:
@@ -1434,8 +1441,9 @@ class App:
                              res, "sell to NPC"), "bought"
             elif unsure:
                 pays = self.npc_pays(real, qty) if real else None
-                vals, tag = (f"{real or raw} (price?)", qty, f"{price:,} ?", "-" if pays is None else f"{pays:,}",
-                             "check price", shop), "unsure"
+                odd = key in self.odd_name
+                vals, tag = (f"{real or raw} ({'name' if odd else 'price'}?)", qty, f"{price:,}" + ("" if odd else " ?"),
+                             "-" if pays is None else f"{pays:,}", "check name" if odd else "check price", shop), "unsure"
             elif p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
             else:
@@ -1879,12 +1887,33 @@ class App:
             self.cfg["mini_pos"] = [self.mini.winfo_x(), self.mini.winfo_y()]
         save_json(CONFIG_FILE, self.cfg)
 
+    def left_shop(self):
+        """Closed a shop with a good deal still in it: say so - loudly if it was a big one."""
+        shop = self.cur_shop
+        if not shop or getattr(self, "warned_shop", None) == (shop, self.shops_today):
+            return False
+        self.warned_shop = (shop, self.shops_today)
+        deals = [(self.profit(v), v) for k, v in self.seen.items() if self.seen_shop.get(k) == shop
+                 and k not in self.unsure and k not in self.bought_keys]
+        deals = [(p, v) for p, v in deals if p is not None and p >= max(1000, 5 * self.min_p())]
+        if not deals:
+            return False
+        p, v = max(deals, key=lambda x: x[0])
+        self.say(f"⚠ You left {shop} without buying {v[0]} (+{p:,})!")
+        self.set_banner(f"⚠ MISSED at {shop}: {v[0]} for {v[3]:,} → +{p:,}" +
+                        (f"  (+{len(deals) - 1} more)" if len(deals) > 1 else "") + " - go back?", "#ff3b3b", "#fff")
+        if self.beep.get():
+            import winsound
+            threading.Thread(target=lambda: [winsound.Beep(f, 140) for f in (880, 660, 440)], daemon=True).start()
+        return True
+
     def new_shop(self, seller):
         """Another shop: drop the losers of the previous ones, keep the profitable items
         until they are bought."""
+        missed = self.left_shop()
         for key, v in list(self.seen.items()):
             p = self.profit(v)
-            if (p is None or p <= 0 or p < self.min_p()) and key not in self.bought_keys:
+            if (p is None or p <= 0 or p < self.min_p() or key in self.unsure) and key not in self.bought_keys:
                 del self.seen[key]
                 self.unsure.discard(key)
         self.save_shop()  # the shop you just left
@@ -1904,7 +1933,7 @@ class App:
             self.set_banner(f"↺ {self.cur_shop}: checked {ago(self.revisit[0])} - "
                             + (f"best was +{self.revisit[1]:,}" if self.revisit[1] else "nothing then"),
                             "#5b6abf", "#fff")
-        else:
+        elif not missed:  # (keep the 'MISSED' warning up until this shop has been read)
             self.set_banner(f"🔍 Reading {seller or 'the shop'}...", "#e8e8e8", "#555")
         self.shops_lbl.config(text=f"Shops checked this session: {self.shops_today}    "
                                    f"Profit spotted: +{self.found_today:,}")
