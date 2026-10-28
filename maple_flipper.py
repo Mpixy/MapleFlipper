@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.56"
+VERSION = "0.57"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -511,10 +511,12 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
                 continue  # empty slot / tooltip in the way
         icon = img[ny + 2:ny + 34, nx - 62:nx - 16] if nx >= 62 else None
         ikey = pix_key(np.ascontiguousarray(icon)) if icon is not None and icon.size else None
-        iname = MEM.icon_name(ikey) if MEM else None
         nkey = pix_key(crops[1])
         nmem = MEM.names.get(nkey) if MEM else None  # this exact name picture was read before
-        name = iname or (nmem[0] if nmem else read_line(crops[1]))
+        name = nmem[0] if nmem else read_line(crops[1])
+        # the icon only helps when the text isn't a known item (it once learned 'Saw' as 'Sai')
+        iname = MEM.icon_name(ikey) if MEM and match_hint(name) is False else None
+        name = iname or name
         if re.search(r"[A-Za-z]{2}", name):
             rect = (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4))
             found.append((name, got, crops, rect, ink_width(crops[0]), pkey, bool(mem), ikey, iname, ptxt,
@@ -677,13 +679,28 @@ def ago(t):
 
 def shop_mesos(img, btn):
     """Your own mesos, shown in the player-shop window under the BUY ITEM button. Read it while
-    you shop: a drop by an item's price = you bought it (no 'Set mesos area' needed)."""
+    you shop: a drop by an item's price = you bought it (no 'Set mesos area' needed).
+    The white number box is found by its colour, so a bigger / smaller window still works
+    (the box's border was once read as an extra '1': '171,0571')."""
     x, y = int(btn[0]), int(btn[1])
-    field = img[max(y + 80, 0):y + 107, max(x - 55, 0):x + 110]
-    if field.shape[0] < 15 or field.shape[1] < 100:
+    area = img[max(y + 60, 0):y + 130, max(x - 90, 0):x + 140]
+    if area.shape[0] < 20 or area.shape[1] < 120:
         return None
-    t = read_line(np.ascontiguousarray(field)).replace(" ", "").strip(",.")
-    return to_int(t) if re.fullmatch(r"\d{1,3}(,\d{3})+|\d{1,6}", t) else None
+    white = (area[:, :, :3] > 235).all(axis=2)
+    rows = np.nonzero(white.mean(axis=1) > 0.45)[0]
+    runs = np.split(rows, np.nonzero(np.diff(rows) > 1)[0] + 1) if len(rows) else []
+    rows = max(runs, key=len) if len(runs) else rows  # the tallest white band = the number box
+    if len(rows) >= 10:
+        band = white[rows[0]:rows[-1] + 1]
+        cols = np.nonzero(band.mean(axis=0) > 0.5)[0]
+        field = area[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1] if len(cols) > 60 else None
+    else:
+        field = None
+    if field is None:
+        field = img[max(y + 80, 0):y + 107, max(x - 55, 0):x + 110]
+    t = read_line(np.ascontiguousarray(field)).replace(" ", "")
+    m = re.search(r"\d{1,3}(?:[,.]\d{3})+|\d{1,6}", t)
+    return to_int(m.group(0)) if m else None
 
 
 def same_seller(a, b):
@@ -1181,6 +1198,7 @@ class App:
                     btn = find_shop_button(screen[:, :, ::-1])  # screen grabs are BGR
                     v = shop_mesos(screen, btn) if btn else None
                     if v is not None:  # your mesos in the shop window: 2 equal reads in a row
+                        self.shop_mesos_t = time.time()
                         m_hits = m_hits + 1 if v == m_pending else 1
                         m_pending = v
                         old = self.mesos
@@ -1453,6 +1471,20 @@ class App:
         exp = npc_value(item, db, qty)
         return exp * 0.6 <= got <= exp * 1.6
 
+    def lookalike_loses(self, real, qty, price):
+        """Is there an item one letter away ('Sai' / 'Saw') that would make this a loss? Then
+        a single misread letter decides between +10,000 and -1,000: don't shout, ask to check."""
+        cache = self.__dict__.setdefault("_look", {})
+        if real not in cache:
+            k = norm(real)
+            cache[real] = [n for n in self.names if n != real and abs(len(norm(n)) - len(k)) <= 1
+                           and Levenshtein.distance(norm(n), k) <= 1] if len(k) <= 12 else []
+        for other in cache[real]:
+            pays = self.npc_pays(other, qty)
+            if pays is not None and pays - price < 0:
+                return True
+        return False
+
     def worth(self, name, qty, price):
         """Would this row show up as profitable? (only those get their price double-checked)"""
         real, _ = match_name(name, self.names, self.learned)
@@ -1485,8 +1517,9 @@ class App:
                             and Levenshtein.distance(norm(k[0]), norm(name)) <= 2), key)
             v = (real, name, qty, price)
             pays = self.npc_pays(real, qty) if real else None
-            if sure and pays and pays >= 4 * price and pays - price >= 2000 and (
-                    score < 100 or len(norm(real)) <= 4):
+            if sure and pays and pays - price >= 1000 and (
+                    (pays >= 4 * price and (score < 100 or len(norm(real)) <= 4))
+                    or self.lookalike_loses(real, qty, price)):
                 # a huge deal on a short / not-quite-matching name: the mouse cursor over 'Saw'
                 # made it 'Sai' (13,500). Too good to trust without a look.
                 sure = False
@@ -2318,6 +2351,8 @@ class App:
                 v = self.read_mesos(img)
             except Exception:
                 v = None
+            if v is not None and time.time() - getattr(self, "shop_mesos_t", 0) < 3:
+                v = None  # in a shop: its own mesos box is read instead (two sources would fight)
             if v is not None:
                 # require identical reads in a row so OCR glitches aren't logged; a value that
                 # looks like the old one with a digit lost/added has to hold much longer
