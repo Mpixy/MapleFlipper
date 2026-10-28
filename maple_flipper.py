@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.55"
+VERSION = "0.56"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -148,6 +148,7 @@ class Memory:
         self.price = d.get("price", {})
         self.icon = d.get("icon", {})
         self.bought = d.get("bought", {})
+        self.names = d.get("names", {})  # picture of a name line -> [text, matched for sure]
         self.dirty, self.saved = False, time.time()
         self.lock = threading.Lock()  # scans (worker thread) write while the window saves
 
@@ -171,14 +172,22 @@ class Memory:
                 self.price[key] = [qty, price]
                 self.dirty = True
 
+    def learn_name(self, key, text, known):
+        if self.names.get(key) != [text, known]:
+            with self.lock:
+                self.names[key] = [text, known]
+                self.dirty = True
+
     def save(self, force=False):
         if self.dirty and (force or time.time() - self.saved > 30):
             with self.lock:
                 for dct in (self.price, self.icon):
                     while len(dct) > 30000:
                         dct.pop(next(iter(dct)))
+                while len(self.names) > 30000:
+                    self.names.pop(next(iter(self.names)))
                 data = {"price": dict(self.price), "icon": {k: dict(v) for k, v in self.icon.items()},
-                        "bought": dict(self.bought)}
+                        "bought": dict(self.bought), "names": dict(self.names)}
                 self.dirty, self.saved = False, time.time()
             save_json(MEMORY_FILE, data)
 
@@ -503,15 +512,18 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
         icon = img[ny + 2:ny + 34, nx - 62:nx - 16] if nx >= 62 else None
         ikey = pix_key(np.ascontiguousarray(icon)) if icon is not None and icon.size else None
         iname = MEM.icon_name(ikey) if MEM else None
-        name = iname or read_line(crops[1])
+        nkey = pix_key(crops[1])
+        nmem = MEM.names.get(nkey) if MEM else None  # this exact name picture was read before
+        name = iname or (nmem[0] if nmem else read_line(crops[1]))
         if re.search(r"[A-Za-z]{2}", name):
             rect = (nx - 50, ny - 4, width + 54, py + ph + 4 - (ny - 4))
-            found.append((name, got, crops, rect, ink_width(crops[0]), pkey, bool(mem), ikey, iname, ptxt))
+            found.append((name, got, crops, rect, ink_width(crops[0]), pkey, bool(mem), ikey, iname, ptxt,
+                          nkey, nmem))
     # how wide one character is: the median over this page and earlier pages
     here = [w / len(f"{q} for {p:,} mesos") for _, (q, p, _), _, _, w, *_ in found if w]
     ref = float(np.median(_char_px[-30:] + here)) if len(_char_px + here) >= 3 else None
     items = []
-    for name, (qty, cost, formed), crops, rect, w, pkey, from_mem, ikey, iname, ptxt in found:
+    for name, (qty, cost, formed), crops, rect, w, pkey, from_mem, ikey, iname, ptxt, nkey, nmem in found:
         tries = []
         if from_mem:
             fits = sure = True
@@ -539,7 +551,7 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
                         break
                     if sure:
                         break
-        if not iname and match_hint(name) is False:  # unknown name: try harder
+        if not iname and not nmem and match_hint(name) is False:  # unknown name: try harder (once)
             for how in ("big", "big3", "bw"):
                 name2 = read_variant(crops[1], how, text=True)
                 tries.append(("name-" + how, name2))
@@ -552,11 +564,13 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
         if MEM and sure and not from_mem:
             MEM.learn_price(pkey, qty, cost)
         real, score = matcher(name) if matcher else (None, 0)
+        if MEM and not iname and not nmem:  # next time: no OCR, no retries for this name
+            MEM.learn_name(nkey, name, bool(real))
         if MEM and real and score == 100 and sure:
             MEM.learn_icon(ikey, real)
         dlog("row", name=name, icon_name=iname, real=real, score=score, price_text=ptxt, qty=qty,
              price=cost, sure=bool(sure), width=w, char_px=round(ref, 2) if ref else None,
-             mem=from_mem, tries=tries)
+             mem=from_mem, name_mem=bool(nmem), tries=tries)
     del _char_px[:-60]
     dlog("rows", n=len(items), faded=last_faded, ms=int((time.time() - t0) * 1000))
     return items
