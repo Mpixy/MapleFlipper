@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.53"
+VERSION = "0.54"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -59,13 +59,23 @@ def load_json(path, default):
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return default
+    except Exception:  # damaged: keep it aside (not overwritten) and start fresh
+        try:
+            os.replace(path, path + time.strftime(".bad-%m%d-%H%M%S"))
+        except OSError:
+            pass
         return default
 
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
+    """Write to a temp file and swap it in: a crash / power cut mid-save can't wipe what
+    the app learned."""
+    tmp = f"{path}.{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=None if path == MEMORY_FILE else 1)
+    os.replace(tmp, path)
 
 
 def log_error(etype, value, tb):
@@ -139,6 +149,7 @@ class Memory:
         self.icon = d.get("icon", {})
         self.bought = d.get("bought", {})
         self.dirty, self.saved = False, time.time()
+        self.lock = threading.Lock()  # scans (worker thread) write while the window saves
 
     def icon_name(self, key):
         votes = self.icon.get(key) if key else None
@@ -149,22 +160,27 @@ class Memory:
 
     def learn_icon(self, key, name):
         if key:
-            v = self.icon.setdefault(key, {})
-            v[name] = min(v.get(name, 0) + 1, 50)
-            self.dirty = True
+            with self.lock:
+                v = self.icon.setdefault(key, {})
+                v[name] = min(v.get(name, 0) + 1, 50)
+                self.dirty = True
 
     def learn_price(self, key, qty, price):
         if self.price.get(key) != [qty, price]:
-            self.price[key] = [qty, price]
-            self.dirty = True
+            with self.lock:
+                self.price[key] = [qty, price]
+                self.dirty = True
 
     def save(self, force=False):
         if self.dirty and (force or time.time() - self.saved > 30):
-            for dct in (self.price, self.icon):
-                while len(dct) > 30000:
-                    dct.pop(next(iter(dct)))
-            save_json(MEMORY_FILE, {"price": self.price, "icon": self.icon, "bought": self.bought})
-            self.dirty, self.saved = False, time.time()
+            with self.lock:
+                for dct in (self.price, self.icon):
+                    while len(dct) > 30000:
+                        dct.pop(next(iter(dct)))
+                data = {"price": dict(self.price), "icon": {k: dict(v) for k, v in self.icon.items()},
+                        "bought": dict(self.bought)}
+                self.dirty, self.saved = False, time.time()
+            save_json(MEMORY_FILE, data)
 
 
 MEM = None  # created by the app (after the data folder exists)
@@ -961,6 +977,8 @@ class App:
             self.root.after(200, self.toggle_mini)
         self.root.bind_all("<F8>", lambda e: self.scan())
         self.start_hotkey()
+        # load the text reader now, not when the first shop opens (that cost 1-3 s right then)
+        threading.Thread(target=lambda: ocr(np.zeros((32, 96, 3), np.uint8)), daemon=True).start()
         threading.Thread(target=self.auto_loop, daemon=True).start()
         if len(self.prices) < 500 or os.path.exists(PRICES_FILE + ".progress"):  # first run / cut off
             self.root.after(300, self.update_db)
