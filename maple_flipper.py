@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.48"
+VERSION = "0.49"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -565,6 +565,12 @@ def norm(s):
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
+def ignored(name):
+    """Arrows: an NPC pays next to nothing for them - not even listed."""
+    n = norm(name)
+    return "arrowsfor" in n or "arrowfor" in n
+
+
 def npc_value(name, unit_price, qty):
     """Stars/bullets are one rechargeable item: the shop shows the ammo count, not a stack.
     Arrows: '500 for 200 mesos' looks like 500 x 1 meso, but an NPC pays next to nothing
@@ -726,6 +732,9 @@ class App:
         self.rows = []
         self.incomplete = False
         self.shop_btn = None
+        self.shop_btn_abs = None  # the BUY ITEM button on the screen (for the saved layout)
+        self.layout_try = False  # this shop was opened with the saved layout (no text detection)
+        self.redetect = False
         self.shop_sig = None
         self.shop_seen = 0.0
         self.busy_since = 0.0
@@ -948,7 +957,7 @@ class App:
                         self.say("Shop closed - waiting for the next shop.")
                         continue
                 if not box:  # no shop known: look for one (cheap colour check, no OCR)
-                    time.sleep(0.25)
+                    time.sleep(0.08)
                     screen = grab()
                     btn = find_shop_button(screen[:, :, ::-1])
                     if not btn:
@@ -966,20 +975,34 @@ class App:
                         same_seller(sig, self.shop_sig) or (near and not (sig and self.shop_sig)))
                     self.shop_btn, self.shop_sig = btn, sig or (self.shop_sig if same_shop else "")
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
-                    # just the item list (left half, under the buttons): less to read = faster
-                    cand = {"left": max(x - 330, mon["left"]), "top": max(y + 80, mon["top"]),
-                            "width": 420, "height": 520}
+                    self.shop_btn_abs = (x, y)
                     if not same_shop:
                         self.root.after(0, self.new_shop, sig)
                     self.say(f"Shop of {sig or '?'} - reading it...")
-                    self.root.after(0, self.scan, True, cand)
+                    lay = self.cfg.get("layout")
+                    if lay:  # every shop window looks the same: read the rows right away
+                        self.shop_box = {"left": x + lay["dx"], "top": y + lay["dy"],
+                                         "width": lay["w"], "height": lay["h"]}
+                        self.rows = [[tuple(a[:3]) + (None,) for a in row] for row in lay["rows"]]
+                        self.scanned, self.layout_try = None, True
+                        self.root.after(0, self.scan, True, self.shop_box)
+                    else:
+                        # just the item list (left half, under the buttons): less to read = faster
+                        cand = {"left": max(x - 330, mon["left"]), "top": max(y + 80, mon["top"]),
+                                "width": 490, "height": 520}
+                        self.root.after(0, self.scan, True, cand)
                     last = None
+                    continue
+                if self.redetect:  # the saved layout didn't fit: find the shop the slow way
+                    self.redetect, tried, last = False, None, None
                     continue
                 tried = None
                 self.shop_seen = time.time()
                 img = grab(box)
             except Exception:
                 continue
+            if last is not None and changed(img, last, 0.01) and getattr(self, "overlay", None):
+                self.root.after(0, self.hide_marks)  # scrolling / bought: old frames would point at wrong rows
             # the list stopped moving and shows something we haven't read yet -> scan it
             if not changed(img, last, 0.01) and changed(img, self.scanned, 0 if self.incomplete else 0.02):
                 screen = grab()
@@ -1094,6 +1117,13 @@ class App:
                 if box and box is self.shop_box and self.rows:
                     items = read_rows(img, self.rows, worth=self.worth)  # fast: known rows, cached text
                     all_grey = not items and last_faded > 0
+                    if self.layout_try:
+                        self.layout_try = False
+                        if not items and not all_grey:  # saved layout doesn't fit this window
+                            self.cfg.pop("layout", None)
+                            self.shop_box, self.rows, self.redetect = None, [], True
+                            self.busy = False
+                            return
                 if not items and not all_grey:  # (a page of only greyed-out rows: done)
                     lines = ocr(img)
                     items = find_shop_items(lines)
@@ -1135,6 +1165,11 @@ class App:
                             items = [(it[0], it[1], it[2], it[4]) for it in got]
                             rects = [it[3] for it in got]
                             self.scanned = sub  # the loop now only rescans when the list changes
+                            b = self.shop_btn_abs
+                            if b and len(self.rows) >= 5:  # a full window: remember its layout
+                                self.cfg["layout"] = {"dx": nb["left"] - b[0], "dy": nb["top"] - b[1],
+                                                      "w": nb["width"], "h": nb["height"],
+                                                      "rows": [[list(a[:3]) for a in row] for row in self.rows]}
                         elif last_faded:
                             items, rects = [], []  # everything on this page is greyed out
                             self.scanned = sub
@@ -1179,8 +1214,13 @@ class App:
 
     def apply_scan(self, items, rects, mark_box, auto, took):
         new_good, new_watch, marks, page = False, [], [], {}
+        keep = [i for i, it in enumerate(items) if not ignored(it[0])]  # arrows: never worth anything
+        if rects:
+            rects = [rects[i] for i in keep]
+        items = [items[i] for i in keep]
+        prev_page, prev_order = self.on_page, getattr(self, "page_order", [])
         if items:
-            self.on_page = set()
+            self.on_page, self.page_order = set(), []
         for i, (name, qty, price, sure) in enumerate(items):
             real, score = match_name(name, self.names, self.learned)
             key = (real or name, price)
@@ -1200,6 +1240,7 @@ class App:
             self.seen_shop[key] = self.cur_shop
             page[key] = page.get(key, 0) + 1
             self.on_page.add(key)
+            self.page_order.append(key)
             self.seen_t[key] = time.time()
             watched = self.watched(real or name)
             if watched and (key, self.cur_shop) not in self.watch_seen:
@@ -1208,6 +1249,14 @@ class App:
             if rects and (good or watched):
                 marks.append((rects[i], p if good else None))
         self.count.update(page)
+        # the same page again with an item missing from the middle: it was bought (by you or
+        # someone else). Missing at the top / bottom is just scrolling.
+        gone = {k for k in prev_page - self.on_page if k in prev_order[1:-1]}
+        if items and gone and len(prev_page & self.on_page) >= max(len(prev_page) - 2, 2):
+            for k in gone:
+                if k not in self.bought_keys and self.seen_shop.get(k) == self.cur_shop:
+                    self.seen.pop(k, None)
+                    self.count.pop(k, None)
         if mark_box and mark_box is self.shop_box:
             self.draw_marks(mark_box, marks)
         profits = [p for _, p in marks if p is not None]
@@ -1817,7 +1866,7 @@ class App:
                 self.unsure.discard(key)
         self.save_shop()  # the shop you just left
         self.cur_shop = seller
-        self.on_page = set()
+        self.on_page, self.page_order = set(), []
         self.shops_today += 1
         name = self.known_shop(seller)
         rec = self.shops.get(name) if name else None
