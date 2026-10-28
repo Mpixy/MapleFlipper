@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.47"
+VERSION = "0.48"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -566,8 +566,10 @@ def norm(s):
 
 
 def npc_value(name, unit_price, qty):
-    """Stars/bullets are one rechargeable item: the shop shows the ammo count, not a stack."""
-    if any(k in norm(name) for k in ("throwingstar", "bullet")):
+    """Stars/bullets are one rechargeable item: the shop shows the ammo count, not a stack.
+    Arrows: '500 for 200 mesos' looks like 500 x 1 meso, but an NPC pays next to nothing
+    for a pile of arrows - never count them as a stack (they just show as a loss)."""
+    if any(k in norm(name) for k in ("throwingstar", "bullet", "arrowsfor", "arrowfor")):
         return unit_price
     return unit_price * qty
 
