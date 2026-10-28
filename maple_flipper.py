@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.52"
+VERSION = "0.53"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -625,6 +625,11 @@ def seller_name(img, btn):
     if len(rows) < 8:  # no tag found: fall back to the old fixed spot
         tag = img[max(y + 62, 0):y + 95, max(x - 330, 0):max(x - 110, 0)]
         return read_line(np.ascontiguousarray(tag)) if tag.size else ""
+    split = np.nonzero(np.diff(rows) > 1)[0]  # only the first dark-blue band (the name tag)
+    if len(split):
+        rows = rows[:split[0] + 1]
+    if len(rows) < 8:
+        return ""
     band = navy[rows[0]:rows[-1] + 1]
     cols = np.nonzero(band.sum(axis=0) > len(band) * 0.3)[0]
     tag = area[rows[0] + 1:rows[-1], cols[0] + 2:cols[-1] - 1]
@@ -638,6 +643,17 @@ def seller_name(img, btn):
 def ago(t):
     m = int((time.time() - t) // 60)
     return "just now" if m < 1 else f"{m} min ago" if m < 60 else f"{m // 60}h {m % 60:02d}m ago"
+
+
+def shop_mesos(img, btn):
+    """Your own mesos, shown in the player-shop window under the BUY ITEM button. Read it while
+    you shop: a drop by an item's price = you bought it (no 'Set mesos area' needed)."""
+    x, y = int(btn[0]), int(btn[1])
+    field = img[max(y + 80, 0):y + 107, max(x - 55, 0):x + 110]
+    if field.shape[0] < 15 or field.shape[1] < 100:
+        return None
+    t = read_line(np.ascontiguousarray(field)).replace(" ", "").strip(",.")
+    return to_int(t) if re.fullmatch(r"\d{1,3}(,\d{3})+|\d{1,6}", t) else None
 
 
 def same_seller(a, b):
@@ -866,6 +882,12 @@ Purple frame + sound when one is in a shop, profitable or not.
 KEYS: F8 scan · F9 mini/full window · F10 clear the list
      F11 "this is wrong!" - saves the moment for Claude ('Debug zip' sends it)
 '⟳ Restart' if the app ever gets stuck - nothing is lost.
+
+YOUR MESOS ARE READ FROM THE SHOP WINDOW
+While a shop is open the app reads your mesos (the number under BUY ITEM).
+Mesos drop by an item's price = you bought it: blue 'BOUGHT' row, and it
+won't ask you to buy it again. No setup needed ('Set mesos area' is only
+for selling to NPCs outside a shop).
 
 Orange '(?)' = no price known for that item.
 Double-click any row to look the item up on MeowDB.
@@ -1110,6 +1132,7 @@ class App:
         """Finds a player shop by itself (orange BUY ITEM button), rescans it when the list
         changes (scrolling) and notices when it closes."""
         last, tried, checked, misses = None, None, 0.0, 0
+        m_pending, m_hits = None, 0
         while True:
             time.sleep(0.12)
             if self.busy and time.time() - self.busy_since > 15:
@@ -1122,7 +1145,16 @@ class App:
                 box = self.shop_box
                 if box and time.time() - checked > 0.5:  # is the shop still open / still there?
                     checked = time.time()
-                    btn = find_shop_button(grab()[:, :, ::-1])  # screen grabs are BGR
+                    screen = grab()
+                    btn = find_shop_button(screen[:, :, ::-1])  # screen grabs are BGR
+                    v = shop_mesos(screen, btn) if btn else None
+                    if v is not None:  # your mesos in the shop window: 2 equal reads in a row
+                        m_hits = m_hits + 1 if v == m_pending else 1
+                        m_pending = v
+                        old = self.mesos
+                        glitch = old is not None and (lost_digits(str(v), str(old)) or lost_digits(str(old), str(v)))
+                        if m_hits == (4 if glitch else 2) and v != old:
+                            self.root.after(0, self.on_mesos, v)
                     moved = btn and self.shop_btn and (abs(btn[0] - self.shop_btn[0]) > 40
                                                        or abs(btn[1] - self.shop_btn[1]) > 40)
                     misses = misses + 1 if (not btn or moved) else 0
@@ -1775,9 +1807,12 @@ class App:
             spent = -diff
             cands = [(k, v) for k, v in self.seen.items() if v[0] and k not in self.bought_keys]
             hit = [kv for kv in cands if kv[1][3] == spent]
+            if not hit:  # bought 2+ of the same bundle at once
+                hit = [kv for kv in cands if kv[1][3] and spent % kv[1][3] == 0 and spent // kv[1][3] <= 20]
             if not hit:  # the shop price was misread (a digit lost: 2,999 read as 299)?
                 hit = [kv for kv in cands if lost_digits(str(kv[1][3]), str(spent))]
             if len(hit) != 1 and not any(kv[1][3] == spent for kv in hit):
+                dlog("spent_unmatched", spent=spent, candidates=[kv[1][0] for kv in hit])
                 return
             key, v = next((kv for kv in hit if kv[1][3] == spent), hit[0])
             real, raw, qty, price = v
