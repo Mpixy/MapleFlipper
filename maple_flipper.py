@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.58"
+VERSION = "0.59"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -967,6 +967,8 @@ class App:
         self.stats = load_json(STATS_FILE, {"flips": [], "to_sell": []})
         # bought from player shops, waiting to be sold: [item, text read, qty, expected NPC value, paid]
         self.bought = self.stats["to_sell"]
+        # things bought for yourself (a loss at the NPC) were never flips: drop them
+        self.bought[:] = [b for b in self.bought if b[3] is None or b[3] - b[4] > 0]
         self.shop_box = None
         self.scanned = None
         self.rows = []
@@ -1890,6 +1892,13 @@ class App:
                 return
             key, v = next((kv for kv in hit if kv[1][3] == spent), hit[0])
             real, raw, qty, price = v
+            p = self.profit((real, raw, qty, spent))
+            if (p is None or p <= 0) and not self.watched(real):
+                # bought for yourself (no profit selling it to an NPC): not a flip, don't track it
+                dlog("bought_not_flip", item=real, paid=spent, profit=p)
+                self.seen.pop(key, None)
+                self.root.after(0, self.refresh)
+                return
             if price != spent:  # show what you really paid
                 self.seen.pop(key, None)
                 self.unsure.discard(key)
@@ -1926,16 +1935,15 @@ class App:
                 self.refresh()
                 return
         combos = sale_combos([b[3] for b in self.bought], diff)
-        # the same names in a different order are the same answer (e.g. which of 3 Gold Earrings)
-        kinds = {tuple(sorted(self.bought[i][0] for i in c)) for c in combos}
-        if len(kinds) == 1:
-            self.sold_many(combos[0])
+        if combos:
+            # several sets add up: any of them is the same profit, take the one with the most items
+            # (selling everything you carry at once is the usual case). Never ask.
+            self.sold_many(max(combos, key=len))
         elif len(self.bought) == 1 and self.plausible(self.bought[0][0], self.bought[0][2], diff):
             self.apply_sale(0, diff)
-        elif len(self.bought) == 1:
-            return  # a gain that has nothing to do with it (another sale, a quest, a drop)
         else:
-            self.sell_dialog(diff, combos[0] if combos else ())
+            # a gain that has nothing to do with the flips (a trade, a quest, other items sold)
+            dlog("gain_unmatched", gain=diff, waiting=[b[0] for b in self.bought])
 
     def sold(self, item):
         """Sold to the NPC: the 'BOUGHT' row is done."""
