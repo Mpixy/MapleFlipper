@@ -56,10 +56,20 @@ jobs:
           Copy-Item README.txt dist/MapleFlipper/
           Compress-Archive dist/MapleFlipper/* MapleFlipper-Windows.zip
 
+      - name: Version file (the app's update check reads it)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          v = re.search(r'VERSION = "([\d.]+)"', open("maple_flipper.py", encoding="utf-8").read()).group(1)
+          open("version.txt", "w").write(v)
+          print("version", v)
+          PY
+
       - name: Publish release
         shell: bash
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest MapleFlipper-Windows.zip prices.json \
+          gh release create latest MapleFlipper-Windows.zip prices.json version.txt \
             --title "MapleFlipper (latest)" \
             --notes "Download MapleFlipper-Windows.zip, extract, run MapleFlipper.exe. No Python needed."

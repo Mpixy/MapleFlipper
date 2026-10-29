@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.59"
+VERSION = "0.60"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -38,6 +38,8 @@ LEARN_FILE = os.path.join(DATA, "learned.json")
 STATS_FILE = os.path.join(DATA, "flips.json")
 SHOPS_FILE = os.path.join(DATA, "shops.json")  # shops you visited: seller -> when, best profit
 REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
+RELEASE = "https://github.com/Mpixy/MapleFlipper/releases/download/latest/"
+FROZEN = getattr(sys, "frozen", False)  # running as MapleFlipper.exe
 REPO_SOURCE = "https://raw.githubusercontent.com/Mpixy/MapleFlipper/main/maple_flipper.py"
 BUNDLED_PRICES = os.path.join(getattr(sys, "_MEIPASS", HERE), "prices.json")
 ITEM_URL = "https://meowdb.com/msclassic/item-db/{}"
@@ -1026,7 +1028,7 @@ class App:
             self.say(f"Ready - {len(self.prices):,} item prices loaded. Open a player shop and press F8.")
         if self.wild:
             self.say(f"Fixed {len(self.wild)} wrongly learned prices (back to MeowDB): {', '.join(self.wild[:8])}")
-        if not getattr(sys, "frozen", False) and not os.path.isdir(os.path.join(HERE, ".git")):
+        if not os.path.isdir(os.path.join(HERE, ".git")):  # (a developer's copy updates with git)
             self.root.after(3000, self.check_update)
         if self.cfg.get("tracking") and self.cfg.get("meso_area"):
             self.root.after(800, self.toggle_track)  # was tracking last time: keep going
@@ -1089,6 +1091,8 @@ class App:
         ttk.Button(bar, text="👀 Watch", command=self.watch_dialog).pack(side="right", padx=(0, 6))
         ttk.Button(top, text="⟳ Restart", command=self.restart).pack(side="right")
         ttk.Button(top, text="Debug zip", command=self.debug_zip).pack(side="right", padx=4)
+        ttk.Button(top, text="Check for update", command=lambda: self.check_update(manual=True)
+                   ).pack(side="right", padx=4)
 
         cols = ("item", "qty", "price", "npc", "profit", "shop")
         self.tree = ttk.Treeview(r, columns=cols, show="headings", height=14)
@@ -1148,27 +1152,74 @@ class App:
             self.log.delete(200, "end")
         self.root.after(0, ui)
 
-    def check_update(self):
-        """Look for a newer version on GitHub every 20 minutes."""
+    def latest_version(self):
+        """The newest version you can update to: for the .exe the one already built on GitHub
+        (a change is built a minute or two after it is merged), else the newest code."""
+        if FROZEN:
+            try:
+                v = requests.get(RELEASE + "version.txt", timeout=15)
+                if v.status_code == 200 and re.fullmatch(r"[\d.]+", v.text.strip()):
+                    return v.text.strip()
+            except requests.RequestException:
+                pass
+        src = requests.get(REPO_SOURCE, timeout=15).text
+        m = re.search(r'VERSION = "([\d.]+)"', src)
+        return m.group(1) if m else None
+
+    def check_update(self, manual=False):
+        """Look for a newer version (every 20 minutes, and when you press the button)."""
         def work():
             try:
-                src = requests.get(REPO_SOURCE, timeout=15).text
-                m = re.search(r'VERSION = "([\d.]+)"', src)
-                newer = m and tuple(map(int, m.group(1).split("."))) > tuple(map(int, VERSION.split(".")))
-                if newer:
-                    self.root.after(0, lambda: (self.update_btn.config(text=f"⬆ Update to v{m.group(1)}"),
-                                                self.update_btn.pack(side="left", padx=8)))
-            except Exception:
-                pass
+                new = self.latest_version()
+            except Exception as e:
+                if manual:
+                    self.say(f"Couldn't check for updates: {e}")
+                return
+            newer = new and tuple(map(int, new.split("."))) > tuple(map(int, VERSION.split(".")))
+            dlog("update_check", have=VERSION, latest=new, manual=manual)
+            if newer:
+                self.root.after(0, lambda: (self.update_btn.config(text=f"⬆ Update to v{new}"),
+                                            self.update_btn.pack(side="left", padx=8)))
+                if manual:
+                    self.root.after(0, lambda: messagebox.askyesno(
+                        "MapleFlipper", f"Version {new} is out (you have {VERSION}).\nUpdate now? "
+                        "It restarts by itself - nothing you learned is lost.") and self.self_update())
+            elif manual:
+                self.say(f"✓ You have the latest version (v{VERSION}).")
         threading.Thread(target=work, daemon=True).start()
-        self.root.after(20 * 60 * 1000, self.check_update)
+        if not manual:
+            self.root.after(20 * 60 * 1000, self.check_update)
 
     def self_update(self):
         """Download the latest version over this one and restart."""
         import io
+        import subprocess
         import zipfile
-        self.say("Updating...")
+        self.say("Updating... (a few seconds)")
+        self.root.update()
         try:
+            if FROZEN:
+                # the .exe can't overwrite itself while running: unpack next to it, then a small
+                # script waits for this window to close, copies the new files in and starts it
+                z = zipfile.ZipFile(io.BytesIO(requests.get(RELEASE + "MapleFlipper-Windows.zip",
+                                                            timeout=180).content))
+                new = os.path.join(DATA, "update_new")
+                import shutil
+                shutil.rmtree(new, ignore_errors=True)
+                z.extractall(new)
+                here = os.path.dirname(sys.executable)
+                bat = os.path.join(DATA, "update.bat")
+                with open(bat, "w", encoding="utf-8") as f:
+                    f.write(f"""@echo off
+:wait
+tasklist /fi "PID eq {os.getpid()}" | find "{os.getpid()}" >nul && (timeout /t 1 /nobreak >nul & goto wait)
+robocopy "{new}" "{here}" /E /NFL /NDL /NJH /NJS /NP >nul
+start "" "{sys.executable}"
+""")
+                dlog("update", to="release", folder=here)
+                subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)  # no console window
+                self.on_close_save()
+                os._exit(0)
             z = zipfile.ZipFile(io.BytesIO(requests.get(REPO_ZIP, timeout=60).content))
             for info in z.infolist():
                 rel = info.filename.split("/", 1)[1] if "/" in info.filename else ""
@@ -1181,7 +1232,6 @@ class App:
             log_error(type(e), e, e.__traceback__)
             self.say(f"Update failed: {e}")
             return
-        import subprocess
         subprocess.Popen([sys.executable, os.path.join(HERE, "maple_flipper.py")])
         self.on_close()
 
@@ -2494,6 +2544,7 @@ class App:
             mm.add_command(label="Your flips (stats)...", command=self.stats_window)
             mm.add_command(label="👀 Watch list...", command=self.watch_dialog)
             mm.add_command(label="⟳ Restart the app", command=self.restart)
+            mm.add_command(label="⬆ Check for update", command=lambda: self.check_update(manual=True))
             mm.add_command(label="Save debug zip (for Claude)", command=self.debug_zip)
             mm.add_separator()
             mm.add_command(label="Quit", command=self.on_close)
