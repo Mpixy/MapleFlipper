@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.60"
+VERSION = "0.61"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1022,6 +1022,7 @@ class App:
         # load the text reader now, not when the first shop opens (that cost 1-3 s right then)
         threading.Thread(target=lambda: ocr(np.zeros((32, 96, 3), np.uint8)), daemon=True).start()
         threading.Thread(target=self.auto_loop, daemon=True).start()
+        self.root.after(1000, self.quit_requested)
         if len(self.prices) < 500 or os.path.exists(PRICES_FILE + ".progress"):  # first run / cut off
             self.root.after(300, self.update_db)
         else:
@@ -1774,6 +1775,17 @@ start "" "{sys.executable}"
             os.startfile(os.path.dirname(out))  # Windows: show it
         except Exception:
             pass
+
+    def quit_requested(self):
+        """A newer copy was started: close (saving everything) so it can take over."""
+        try:
+            if int(open(QUIT_FILE).read().strip()) == os.getpid():
+                dlog("quit_for_new_copy")
+                self.on_close()
+                return
+        except (OSError, ValueError):
+            pass
+        self.root.after(1000, self.quit_requested)
 
     def restart(self):
         """Stuck or acting weird: start the app again (keeps everything it learned)."""
@@ -2613,8 +2625,60 @@ start "" "{sys.executable}"
         self.root.mainloop()
 
 
+PID_FILE = os.path.join(DATA, "running.pid")
+QUIT_FILE = os.path.join(DATA, "quit.request")
+
+
+def our_process_alive(pid):
+    """Is `pid` a running MapleFlipper (python / MapleFlipper.exe)? Checks the program name too,
+    so an unrelated program that got the same number is never touched."""
+    try:
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            k.GetExitCodeProcess(h, ctypes.byref(code))
+            buf, size = ctypes.create_unicode_buffer(1024), ctypes.c_ulong(1024)
+            k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+            name = os.path.basename(buf.value).lower()
+            return code.value == 259 and ("python" in name or "mapleflipper" in name)  # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        return False
+
+
+def close_old_copy():
+    """Started again (START.bat / the exe) while an older copy still runs: ask it to close
+    (it saves everything first), and if it doesn't within 5 s, end it. Two copies would fight
+    over the screen, the hotkeys and the files."""
+    try:
+        old = int(open(PID_FILE).read().strip())
+    except (OSError, ValueError):
+        old = None
+    if old and old != os.getpid() and our_process_alive(old):
+        with open(QUIT_FILE, "w") as f:
+            f.write(str(old))
+        for _ in range(50):
+            if not our_process_alive(old):
+                break
+            time.sleep(0.1)
+        else:
+            os.system(f"taskkill /PID {old} /F >nul 2>&1")
+        dlog("closed_old_copy", pid=old)
+    try:
+        os.remove(QUIT_FILE)
+    except OSError:
+        pass
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--build-prices":  # used by the release build
         print(update_prices(lambda t, p=None: print(t, flush=True), path=sys.argv[2]))
     else:
+        close_old_copy()
         App().run()
