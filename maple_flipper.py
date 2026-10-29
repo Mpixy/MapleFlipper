@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.57"
+VERSION = "0.58"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -703,6 +703,11 @@ def shop_mesos(img, btn):
     return to_int(m.group(0)) if m else None
 
 
+def clock(sec):
+    sec = int(sec)
+    return f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}"
+
+
 def same_seller(a, b):
     return bool(a) and bool(b) and Levenshtein.distance(norm(a), norm(b)) <= 2
 
@@ -884,7 +889,7 @@ HELP_TEXT = """FIND PROFITABLE ITEMS
 4. Scroll down in the shop and press F8 again - the list keeps growing.
 5. 'Clear list' before visiting the next shop.
 
-TRACK YOUR MESOS
+TRACK YOUR MESOS  (a timer runs while tracking: time, profit, profit per hour)
 1. Open your inventory in the game.
 2. Click 'Set mesos area' and drag a box around the mesos number.
 3. Click 'Start tracking'. Every buy / NPC sale is logged with the profit.
@@ -989,6 +994,8 @@ class App:
         self.cur_shop = ""
         self.shops = load_json(SHOPS_FILE, {})
         self.session_t = time.time()
+        self.track_t0 = None  # when 'Start tracking' was pressed (the timer)
+        self.track_flips = 0  # profit of the flips finished since then
         self.on_page = set()  # item keys on the shop page you are looking at right now
         self.seen_t = {}  # item key -> when it was last on screen
         self.count = {}  # item key -> how many identical rows the shop page has (Lemona ×2)
@@ -1104,6 +1111,8 @@ class App:
         ttk.Button(row, text="Set mesos area", command=self.set_area).pack(side="left")
         self.track_btn = ttk.Button(row, text="▶ Start tracking", command=self.toggle_track)
         self.track_btn.pack(side="left", padx=6)
+        self.timer_lbl = ttk.Label(row, font=("Consolas", 12, "bold"), foreground="#1a5fb4", text="")
+        self.timer_lbl.pack(side="left", padx=8)
         self.meso_lbl = ttk.Label(box, font=("Segoe UI", 12, "bold"), text="Mesos: -")
         self.meso_lbl.pack(anchor="w", padx=6)
         self.tosell_lbl = ttk.Label(box, foreground="#b35c00", wraplength=520, cursor="hand2")
@@ -1944,6 +1953,8 @@ class App:
         self.stats["flips"].append({"time": time.strftime("%Y-%m-%d %H:%M"), "item": item,
                                     "paid": paid, "got": got, "shop": seller})
         self.session_flips += got - paid
+        if self.track_t0:
+            self.track_flips += got - paid
         self.save_stats()
 
     def stats_window(self):
@@ -2337,7 +2348,33 @@ class App:
         if self.tracking:
             self.start_mesos = self.mesos = None
             self.hist.delete(0, "end")
+            self.track_t0, self.track_flips = time.time(), 0
+            dlog("track_start")
+            self.tick()
             threading.Thread(target=self.track_loop, daemon=True).start()
+        elif self.track_t0:
+            spent = time.time() - self.track_t0
+            self.say(f"⏱ Tracked {clock(spent)} - flips {self.track_flips:+,} ({self.per_hour():+,}/h)")
+            dlog("track_stop", seconds=int(spent), flips=self.track_flips)
+            self.track_t0 = None
+            self.timer_lbl.config(text="")
+            self.update_mini_mesos()
+
+    def per_hour(self):
+        hours = max((time.time() - self.track_t0) / 3600, 0.25) if self.track_t0 else 1
+        return round(self.track_flips / hours)
+
+    def tick(self):
+        """The tracking timer: once a second, on the window and the mini bar."""
+        if not self.track_t0:
+            return
+        txt = f"⏱ {clock(time.time() - self.track_t0)}"
+        if self.track_flips:
+            txt += f"   {self.track_flips:+,} ({self.per_hour():+,}/h)"
+        self.timer_lbl.config(text=txt, foreground="#1a8f3a" if self.track_flips >= 0 else "#c01c28")
+        if self.mini:
+            self.mini_timer.config(text=f"⏱ {clock(time.time() - self.track_t0)}")
+        self.root.after(1000, self.tick)
 
     def track_loop(self):
         pending, hits, last_img = None, 0, None
@@ -2412,6 +2449,8 @@ class App:
         self.mini_mesos.pack(side="left", padx=4)
         self.mini_flips = tk.Label(top, text="", bg="#1f1f24", fg="#5ee07a", font=("Segoe UI", 10, "bold"))
         self.mini_flips.pack(side="left", padx=4)
+        self.mini_timer = tk.Label(top, text="", bg="#1f1f24", fg="#7fb8ff", font=("Consolas", 10, "bold"))
+        self.mini_timer.pack(side="left", padx=4)
         self.mini_deal = tk.Label(m, text=self.banner.cget("text"), bg=self.banner.cget("bg"),
                                   fg=self.banner.cget("fg"), font=("Segoe UI", 12, "bold"),
                                   wraplength=400, justify="left", anchor="w", padx=8, pady=5)
@@ -2452,7 +2491,8 @@ class App:
             mm.add_command(label="Quit", command=self.on_close)
             mm.tk_popup(e.x_root, e.y_root)
 
-        for w in (m, grip, top, self.mini_mesos, self.mini_flips, self.mini_deal, self.mini_status, self.mini_sell):
+        for w in (m, grip, top, self.mini_mesos, self.mini_flips, self.mini_timer, self.mini_deal, self.mini_status,
+                  self.mini_sell):
             w.bind("<Button-1>", press)
             w.bind("<B1-Motion>", drag)
             w.bind("<Double-1>", lambda e: self.toggle_mini())
@@ -2482,8 +2522,10 @@ class App:
             self.mini_mesos.config(text="Mesos: -", fg="#ddd")
         else:
             self.mini_mesos.config(text=f"{self.mesos:,}", fg="#ddd")
-        hours = max((time.time() - self.session_t) / 3600, 0.25)  # no silly numbers in the first minutes
-        p = self.session_flips
+        if not self.track_t0:
+            self.mini_timer.config(text="")
+        hours = max((time.time() - (self.track_t0 or self.session_t)) / 3600, 0.25)  # no silly numbers at first
+        p = self.track_flips if self.track_t0 else self.session_flips
         self.mini_flips.config(text=f"flips {p:+,}  ({round(p / hours):+,}/h)" if p else "",
                                fg="#5ee07a" if p >= 0 else "#ff6b6b")
         names = [b[0] for b in self.bought]
