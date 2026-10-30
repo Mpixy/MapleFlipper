@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.66"
+VERSION = "0.67"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -711,44 +711,66 @@ def find_cash_badge(img):
 
 
 def tooltip_title(img, badge):
-    """The tooltip's first line (the item's name), about 120 px above the coin."""
+    """The tooltip's first line (the item's name), 90-140 px above the coin."""
     bx, by = badge
-    crop = img[max(by - 145, 0):max(by - 100, 0), max(bx - 120, 0):bx + 280]
-    if crop.size == 0:
-        return ""
-    import cv2
-    # only the bright white title letters: the chat window shows through the see-through tooltip
-    white = crop.min(axis=2) > 215
-    clean = np.where(white[..., None], 255, 40).astype(np.uint8).repeat(3, 2)
-    clean = cv2.resize(clean, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    return re.sub(r"^[^A-Za-z0-9]+", "", read_line(np.ascontiguousarray(clean)) or "").strip()
+    return white_title(img, bx - 130, by - 145, bx + 280, by - 88)
 
 
 def cursor_title(img, cx, cy):
     """The name at the top of the tooltip the game shows under the mouse (cursor in image
     pixels): the tooltip's title sits 45-95 px below and right of the pointer."""
+    return white_title(img, cx - 10, cy + 25, cx + 380, cy + 110)
+
+
+def white_title(img, x0, y0, x1, y1):
+    """The first line of white letters on the dark blue tooltip inside this area."""
     import cv2
-    crop = img[max(cy + 25, 0):max(cy + 110, 0), max(cx - 10, 0):cx + 380]
+    crop = img[max(y0, 0):max(y1, 0), max(x0, 0):max(x1, 0)]
     if crop.size == 0:
         return ""
-    white = crop.min(axis=2) > 215
-    rows = np.where(white.sum(axis=1) >= 3)[0]
-    band = None
-    # blocks of white lines, top first: the title is the first one that is wide like text
-    # (the white glove of the mouse pointer is narrow)
-    for block in np.split(rows, np.where(np.diff(rows) > 3)[0] + 1) if len(rows) else []:
-        cols = np.where(white[block[0]:block[-1] + 1].any(axis=0))[0]
-        px = crop[block[0]:block[-1] + 1, cols[0]:cols[-1] + 1].astype(np.int16)
-        navy = ((px[..., 0] - px[..., 2] > 25) & (px.max(axis=2) < 190)).mean()
-        # white letters on the dark blue tooltip, not a white window (the chat box) behind it
-        if len(block) >= 8 and cols[-1] - cols[0] >= 50 and navy > 0.4:
-            band = white[max(block[0] - 3, 0):block[-1] + 4]
-            break
-    if band is None:
+    px = crop.astype(np.int16)
+    blue = px[..., 0] - px[..., 2]  # the tooltip: dark blue, lighter where a white window is behind it
+    navy = ((blue > 40) | ((blue > 25) & (px.max(axis=2) < 190))).astype(np.uint8)
+    lit = crop.min(axis=2) > 215
+    # white letters with the dark blue tooltip right next to them - not the white chat box
+    # or the white glove of the mouse pointer
+    white = lit & (cv2.dilate(navy, np.ones((5, 5), np.uint8)) > 0)
+    # the title is the first line of the tooltip: start at the tooltip's top edge
+    top = np.where(navy.mean(axis=1) > 0.3)[0]
+    if not len(top):
         return ""
+    y0 = top[0]
+    rows = np.where(white[y0:y0 + 45].sum(axis=1) >= 3)[0] + y0
+    blocks = np.split(rows, np.where(np.diff(rows) > 3)[0] + 1) if len(rows) else []
+    block = next((b for b in blocks if len(b) >= 8), None)
+    if block is None:
+        return ""
+    r0, r1 = max(block[0] - 3, 0), block[-1] + 4
+    inside = np.where(navy[r0:r1].mean(axis=0) > 0.3)[0]  # the tooltip's width on this line
+    if not len(inside):
+        return ""
+    cols = np.where(lit[r0:r1, inside[0]:inside[-1] + 1].any(axis=0))[0] + inside[0]
+    if not len(cols) or cols[-1] - cols[0] < 30:
+        return ""
+    band = lit[r0:r1, cols[0]:cols[-1] + 1]
+    band = np.pad(band, ((10, 10), (30, 30)))  # the reader needs a margin around the letters
     clean = np.where(band[..., None], 255, 40).astype(np.uint8).repeat(3, 2)
-    clean = cv2.resize(clean, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    return re.sub(r"^[^A-Za-z0-9]+", "", read_line(np.ascontiguousarray(clean)) or "").strip()
+    clean = np.ascontiguousarray(cv2.resize(clean, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
+    with _ocr_lock:
+        res, _ = _ocr(clean, use_det=False, use_cls=False)
+    # some versions give the words one by one: put them back together, left to right
+    words = sorted(((r[0][0][0] if len(r) == 3 else 0), r[-2]) for r in res or [] if isinstance(r[-2], str))
+    return re.sub(r"^[^A-Za-z0-9]+", "", " ".join(w for _, w in words)).strip()
+
+
+def covered(img, rect):
+    """Is the dark blue tooltip lying over this row (so its text can't be read)?"""
+    x, y, w, h = rect
+    px = img[max(y, 0):y + h, max(x, 0):x + w].astype(np.int16)
+    if px.size == 0:
+        return False
+    blue = px[..., 0] - px[..., 2]  # (the rows' own pale blue-grey is under 30)
+    return ((blue > 60) | ((blue > 35) & (px.max(axis=2) < 150))).mean() > 0.15
 
 
 def parse_market(doc):
@@ -1769,8 +1791,16 @@ start "" "{sys.executable}"
                     mark_box = nb
                 elif box and not items and not auto:
                     self.shop_box = None
+                base = self.scanned if mark_box is not None and mark_box is self.shop_box else None
+                hidden = 0
+                if rects and base is not None and len(rects) == len(items):
+                    # rows under the game's tooltip read as garbage ('ourist', 'Orange BaseaRE'): skip them
+                    # (only the text: a blue item icon is not a tooltip)
+                    keep = [i for i, (x, y, w, h) in enumerate(rects) if not covered(base, (x + 50, y, w - 50, h))]
+                    hidden = len(items) - len(keep)
+                    items, rects = [items[i] for i in keep], [rects[i] for i in keep]
                 # a row hidden (mouse cursor, tooltip): re-read as soon as anything moves
-                self.incomplete = bool(self.rows) and len(items) + last_faded < len(self.rows)
+                self.incomplete = bool(self.rows) and (hidden > 0 or len(items) + last_faded < len(self.rows))
                 # the list itself is only touched on the window's thread (no races with it)
                 took = time.time() - t
                 shot = None
