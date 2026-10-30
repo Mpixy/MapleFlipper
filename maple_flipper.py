@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.78"
+VERSION = "0.79"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -486,6 +486,7 @@ def faded(crop):
 
 
 last_faded = 0  # greyed-out rows the last read_rows skipped
+last_empty = 0  # empty slots (the list ended above them)
 _char_px = []  # recent pixel widths per character of shop price lines that read cleanly
 
 
@@ -505,14 +506,17 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
        '2,999' -> '299'); doubtful rows get more tries (bigger, black on white) right away,
        instead of you pressing F8 again and again.
     worth(name, qty, price) -> True: rows worth buying, always double-checked."""
-    global last_faded
+    global last_faded, last_empty
     t0 = time.time()
-    found, last_faded = [], 0
+    found, last_faded, last_empty = [], 0, 0
     for (nx, ny, nh, ntext), (px, py, ph, ptext) in rows:
         if min(nx, ny, px, py) < 0 or ny + nh > img.shape[0] or py + ph > img.shape[0]:
             return []
         crops = [np.ascontiguousarray(img[y:y + h, x:x + width])
                  for x, y, h in ((px, py, ph), (nx, ny, nh))]
+        if crops[0].size and blank(crops[0][3:-3, :200].astype(np.int16)) and blank(crops[1][3:-3, :200].astype(np.int16)):
+            last_empty += 1  # an empty slot: the list ends here
+            continue
         if faded(crops[0]):
             last_faded += 1
             continue  # greyed out: can't be bought, don't even read it
@@ -595,6 +599,28 @@ def read_rows(img, rows, width=320, seed=False, worth=None):
     del _char_px[:-60]
     dlog("rows", n=len(items), faded=last_faded, ms=int((time.time() - t0) * 1000))
     return items
+
+
+def empty_below(img, rows, dx=0, dy=0, width=320):
+    """Is the slot right under the last row empty (the list ends on this page)? rows in the
+    coordinates of img minus (dx, dy)."""
+    if len(rows) < 2:
+        return False
+    pitch = rows[-1][1][1] - rows[-2][1][1]
+    if pitch < 20:
+        return False
+    for x, y, h, _ in rows[-1]:
+        y2 = y + dy + pitch
+        crop = img[y2 + 3:y2 + h - 3, x + dx:x + dx + 200].astype(np.int16)
+        if crop.shape[0] < h - 6 or crop.shape[1] < 200 or not blank(crop):
+            return False
+    return True
+
+
+def blank(crop):
+    """No letters at all (not even greyed-out ones): every pixel is close to the background."""
+    bg = np.median(crop.reshape(-1, 3), axis=0)
+    return (np.abs(crop - bg).max(axis=2) > 40).mean() < 0.005
 
 
 def read_variant(crop, how, text=False):
@@ -801,28 +827,45 @@ def dialog_total(img):
 
 
 def scroll_pos(img, btn):
-    """Where the shop list's scrollbar thumb is: (top, bottom) as 0..1 of the track, or None."""
+    """Where the shop list's scrollbar thumb is: (top, bottom) as 0..1 of the track, or None.
+    The bar: a blue arrow at each end, grey track between, a blue thumb somewhere on it."""
     bx, by = int(btn[0]), int(btn[1])
-    x0, x1, y0, y1 = max(bx + 40, 0), bx + 200, max(by + 60, 0), by + 700
-    a = img[y0:y1, x0:x1].astype(np.int16)
+    x0, y0 = max(bx + 20, 0), max(by + 60, 0)
+    a = img[y0:by + 700, x0:bx + 200].astype(np.int16)
+    if not a.size:
+        return None
     grey = (abs(a[..., 0] - 231) < 8) & (abs(a[..., 1] - 231) < 8) & (abs(a[..., 2] - 231) < 8)
-    if not grey.size:
+    blue = (a[..., 0] - a[..., 2] > 40) & (a[..., 0] > 100)
+    best = None
+    for col in np.argsort(-grey.sum(axis=0))[:12]:
+        if grey[:, col].sum() < 40:
+            break
+        ys = np.where(blue[:, col])[0]
+        if len(ys) < 10:
+            continue
+        runs = [r for r in np.split(ys, np.where(np.diff(ys) > 2)[0] + 1) if len(r) >= 5]
+        if len(runs) < 2:
+            continue
+        up, down = runs[0], runs[-1]
+        if not grey[up[-1]:down[0], col].sum() >= 30:  # a grey track between the two arrows
+            continue
+        arrow = min(len(up), len(down))
+        start, end = up[0] + arrow, down[-1] - arrow  # the track, without the arrows
+        mid = [r for r in runs[1:-1]]
+        if mid:
+            t0, t1 = mid[0][0], mid[-1][-1]
+        elif len(up) > len(down) + 5:  # the thumb sits right under the top arrow
+            t0, t1 = start, up[-1]
+        elif len(down) > len(up) + 5:  # ...or right on the bottom arrow
+            t0, t1 = down[0], end
+        else:
+            continue
+        if end - start > 30:
+            best = ((t0 - start) / (end - start), (t1 - start) / (end - start))
+            break
+    if best is None:
         return None
-    col = int(np.argmax(grey.sum(axis=0)))
-    g = grey[:, col]
-    if g.sum() < 40:
-        return None
-    ys = np.where(g)[0]
-    top, bot = ys[0], ys[-1]
-    # the thumb: the part of the track that isn't grey; at the very ends it can hide one end
-    b, r = a[top:bot + 8, col, 0], a[top:bot + 8, col, 2]
-    thumb = np.where((~g[top:bot + 8]) & (b - r > 30))[0]
-    if not len(thumb):
-        return None
-    run = np.split(thumb, np.where(np.diff(thumb) > 2)[0] + 1)[0]  # the thumb, not the arrow under it
-    thumb = run
-    end = bot + 8 - top  # approx track length incl. a thumb sitting at the very bottom
-    return thumb[0] / end, (thumb[-1] + 1) / end
+    return max(0.0, min(1.0, best[0])), max(0.0, min(1.0, best[1]))
 
 
 def covered(img, rect):
@@ -1484,6 +1527,10 @@ start "" "{sys.executable}"
                     v = shop_mesos(screen, btn) if btn else None
                     if btn:
                         sp = scroll_pos(screen, btn)
+                        rows, sb = self.rows, self.shop_box
+                        if rows and sb:  # empty slots under the last row: the list ends on this page
+                            self.page_end = last_empty > 0 or empty_below(
+                                screen, rows, sb["left"] - mon["left"], sb["top"] - mon["top"])
                         self.root.after(0, self.show_progress, int(btn[0]) + mon["left"], int(btn[1]) + mon["top"], sp)
                     if v is not None:  # your mesos in the shop window: 2 equal reads in a row
                         self.shop_mesos_t = time.time()
@@ -1514,9 +1561,12 @@ start "" "{sys.executable}"
                     if self.redetect:  # the saved layout didn't fit: look at this same shop again
                         self.redetect, tried = False, None
                     tried = tried or []
-                    if any(abs(btn[0] - t[0]) < 40 and abs(btn[1] - t[1]) < 40 for t in tried):
-                        continue  # already looked here (NPC shop / not a shop)
-                    tried.append(btn)
+                    # already looked here a moment ago (nothing readable yet): try again after 2 s -
+                    # the text reader still loading, or a box over the list, must not lose the shop
+                    if any(abs(btn[0] - t[0]) < 40 and abs(btn[1] - t[1]) < 40 and time.time() - t[2] < 2
+                           for t in tried):
+                        continue
+                    tried.append((btn[0], btn[1], time.time()))
                     sig = seller_name(screen, btn)
                     near = self.shop_btn is not None and abs(btn[0] - self.shop_btn[0]) < 40 \
                         and abs(btn[1] - self.shop_btn[1]) < 40
@@ -1897,7 +1947,7 @@ start "" "{sys.executable}"
                     items, rects = [items[i] for i in keep], [rects[i] for i in keep]
                 # a row hidden (mouse cursor, tooltip): re-read as soon as anything moves
                 was = self.incomplete
-                self.incomplete = bool(self.rows) and (hidden > 0 or len(items) + last_faded < len(self.rows))
+                self.incomplete = bool(self.rows) and (hidden > 0 or len(items) + last_faded + last_empty < len(self.rows))
                 if self.incomplete and not was:
                     self.incomplete_since = time.time()
                 # the list itself is only touched on the window's thread (no races with it)
@@ -2783,28 +2833,23 @@ start "" "{sys.executable}"
         whole shop has been read (bottom of the list, nothing left unread on the page)."""
         if not self.show_marks.get():
             return self.hide_progress()
-        # the scrollbar's thumb: where in the list you are (no scrollbar = one page only)
+        # the end of the list: empty slots under the last item, or the scrollbar's thumb at the bottom
         if sp:
             self.shop_low = max(getattr(self, "shop_low", 0), sp[1])
-        low = self.shop_low if sp else 1.0
+        low = getattr(self, "shop_low", 0)
         reading = self.busy or self.incomplete or not self.rows
-        done = low >= 0.97 and not reading
+        done = not reading and (getattr(self, "page_end", False) or low >= 0.95)
         if done:
-            text, color = "✔ DONE - next shop", "#00c000"
+            text, color = "✔ DONE - next shop", "#3ddc5a"
         elif reading:
-            text, color = f"📖 reading... {int(low * 100)}%", "#e0a000"
+            text, color = "📖 reading...", "#ffc940"
         else:
-            text, color = f"▼ scroll down  {int(low * 100)}%", "#2b8cff"
+            text, color = "▼ page read - scroll down" + (f"  {int(low * 100)}%" if sp else ""), "#5aa9ff"
         if not getattr(self, "prog_win", None):
             w = tk.Toplevel(self.root)
             w.overrideredirect(True)
             w.attributes("-topmost", True)
-            w.configure(bg="#ff00ff")
-            try:
-                w.attributes("-transparentcolor", "#ff00ff")
-            except tk.TclError:
-                pass
-            self.prog_lbl = tk.Label(w, bg="#ff00ff", font=("Segoe UI", 12, "bold"))
+            self.prog_lbl = tk.Label(w, bg="#1d1f24", font=("Segoe UI", 12, "bold"), padx=8, pady=2)
             self.prog_lbl.pack()
             w.update_idletasks()
             try:  # clicks go through to the game
@@ -2879,7 +2924,7 @@ start "" "{sys.executable}"
         """Another shop: drop the losers of the previous ones, keep the profitable items
         until they are bought."""
         missed = self.left_shop()
-        self.shop_low = 0  # (the progress sign starts again)
+        self.shop_low, self.page_end = 0, False  # (the progress sign starts again)
         dlog("shop", seller=seller, revisit=bool(self.known_shop(seller)))
         for key, v in list(self.seen.items()):
             p = self.profit(v)
