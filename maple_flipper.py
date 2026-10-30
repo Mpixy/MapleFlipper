@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.71"
+VERSION = "0.72"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1410,7 +1410,7 @@ start "" "{sys.executable}"
                 with mss.mss() as sct:
                     mon = sct.monitors[0]
                 box = self.shop_box
-                if box and time.time() - checked > 0.5:  # is the shop still open / still there?
+                if box and time.time() - checked > 0.25:  # is the shop still open / still there?
                     checked = time.time()
                     screen = grab()
                     btn = find_shop_button(screen[:, :, ::-1])  # screen grabs are BGR
