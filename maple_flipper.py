@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.73"
+VERSION = "0.74"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1719,9 +1719,9 @@ start "" "{sys.executable}"
                         # check the fast read once against a full read: a saved layout that is a
                         # bit off reads 1 row of 4 and keeps doing so (Opal Ore never showed up)
                         lines = ocr(img)
-                        full = find_shop_items(lines)
-                        if len(full) > len(items) + last_faded:
-                            dlog("layout_off", fast=len(items), full=len(full), stuck=stuck)
+                        fresh = find_shop_items(lines)
+                        if len(fresh) > len(items) + last_faded:
+                            dlog("layout_off", fast=len(items), full=len(fresh), stuck=stuck)
                             if self.layout_try:
                                 self.cfg.pop("layout2", None)
                             self.rows = shop_rows(lines)
