@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.62"
+VERSION = "0.63"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -753,21 +753,36 @@ def parse_market(data):
     return out
 
 
-def soft_ping():
-    """A short, quiet 'tik' (not the loud system beep) - a small WAV played asynchronously."""
+VOLUME = [0.3]  # 0..1, the volume slider
+
+
+def play(notes, ms=100):
+    """Play a few short tones at the slider's volume (winsound.Beep is always full blast).
+    The tones become a small WAV file, played without waiting."""
     import winsound
-    path = os.path.join(DATA, "ping.wav")
-    if not os.path.exists(path):
-        import wave
-        rate, n = 22050, 2205  # 0.1 s
-        t = np.arange(n) / rate
-        wav = (np.sin(2 * np.pi * 1320 * t) * np.exp(-t * 40) * 3000).astype(np.int16)  # ~10% volume
-        with wave.open(path, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(rate)
-            w.writeframes(wav.tobytes())
+    import wave
+    if VOLUME[0] <= 0:
+        return
+    rate = 22050
+    t = np.arange(int(rate * ms / 1000)) / rate
+    fade = np.minimum(1, np.minimum(t, t[::-1]) * 200)  # no clicks at the start / end
+    wav = np.concatenate([np.sin(2 * np.pi * f * t) * fade for f in notes])
+    wav = (wav * 32000 * VOLUME[0] ** 2).astype(np.int16)  # squared: the slider feels even
+    path = os.path.join(DATA, f"sound-{'-'.join(map(str, notes))}-{ms}-{int(VOLUME[0] * 100)}.wav")
+    if os.path.exists(path):  # (never rewrite a file that may be playing right now)
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+        return
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(wav.tobytes())
     winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+
+
+def soft_ping():
+    """A short, quiet 'tik' for a cheap market find."""
+    play([1320], 60)
 
 
 def ago(t):
@@ -1183,6 +1198,14 @@ class App:
         ttk.Checkbutton(bar, text="Auto", variable=self.auto).pack(side="left", padx=(0, 6))
         self.beep = tk.BooleanVar(value=self.cfg.get("beep", True))
         ttk.Checkbutton(bar, text="Beep", variable=self.beep).pack(side="left")
+        self.volume = tk.IntVar(value=self.cfg.get("volume", 30))
+        VOLUME[0] = self.volume.get() / 100
+        ttk.Label(bar, text="🔊").pack(side="left", padx=(6, 0))
+        vol = ttk.Scale(bar, from_=0, to=100, length=70, variable=self.volume,
+                        command=lambda v: VOLUME.__setitem__(0, float(v) / 100))
+        vol.pack(side="left")
+        vol.bind("<ButtonRelease-1>", lambda e: (self.cfg.__setitem__("volume", self.volume.get()),
+                                                 save_json(CONFIG_FILE, self.cfg), soft_ping()))
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
         ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
@@ -1801,16 +1824,12 @@ start "" "{sys.executable}"
             v = new_watch[0]
             self.say(f"👀 WATCHED ITEM: {v[0] or v[1]} for {v[3]:,} at {self.cur_shop or 'this shop'}!")
             if self.beep.get():
-                import winsound
-                threading.Thread(target=lambda: [winsound.Beep(f, 120) for f in (1000, 750, 1000, 750)],
-                                 daemon=True).start()
+                play([1000, 750, 1000, 750], 120)
         elif new_good and self.beep.get():
-            import winsound
             if best >= max(10000, 10 * self.min_p()):  # jackpot: a little fanfare
-                threading.Thread(target=lambda: [winsound.Beep(f, 90) for f in (660, 880, 1320)],
-                                 daemon=True).start()
+                play([660, 880, 1320], 90)
             else:
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                play([880, 1100], 80)
         elif new_cheap and self.beep.get():
             soft_ping()  # just a quiet tik for a cheap market find
         self.show_banner()
@@ -1917,6 +1936,15 @@ start "" "{sys.executable}"
             save_json(CONFIG_FILE, self.cfg)
             self.refresh()
             self.say(f"👀 Watching '{item}' from now on.")
+
+    def unwatch(self, item):
+        n = norm(item)
+        self.watch = [w for w in self.watch if not (w and norm(w) in n)]
+        self.cfg["watch"] = self.watch
+        save_json(CONFIG_FILE, self.cfg)
+        self.refresh()
+        self.show_banner()
+        self.say(f"Stopped watching '{item}'.")
 
     def complain(self):
         """F11: something looks wrong right now - keep a full screenshot and mark the log, so
@@ -2042,7 +2070,10 @@ start "" "{sys.executable}"
         if real:
             m.add_command(label=f"Wrong item - it is NOT '{real}'", command=lambda: self.fix_item(v, wrong=True))
         m.add_command(label="Pick the correct item...", command=lambda: self.fix_item(v))
-        m.add_command(label=f"👀 Watch '{real or raw}'", command=lambda: self.watch_item(real or raw))
+        if self.watched(real or raw):
+            m.add_command(label=f"✖ Stop watching '{real or raw}'", command=lambda: self.unwatch(real or raw))
+        else:
+            m.add_command(label=f"👀 Watch '{real or raw}'", command=lambda: self.watch_item(real or raw))
         if real:
             m.add_command(label=f"Set real NPC price of '{real}'...", command=lambda: self.ask_price(real))
             if self.is_nx(real):
@@ -2491,7 +2522,7 @@ start "" "{sys.executable}"
 
     def on_close_save(self):
         self.cfg.update(tracking=self.tracking, marks=self.show_marks.get(),
-                        geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
+                        geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(), volume=self.volume.get(),
                         auto=self.auto.get(), mini=self.mini_on)
         self.save_shop()
         if MEM:
@@ -2518,8 +2549,7 @@ start "" "{sys.executable}"
         self.set_banner(f"⚠ MISSED at {shop}: {v[0]} for {v[3]:,} → +{p:,}" +
                         (f"  (+{len(deals) - 1} more)" if len(deals) > 1 else "") + " - go back?", "#ff3b3b", "#fff")
         if self.beep.get():
-            import winsound
-            threading.Thread(target=lambda: [winsound.Beep(f, 140) for f in (880, 660, 440)], daemon=True).start()
+            play([880, 660, 440], 140)
         return True
 
     def new_shop(self, seller):
