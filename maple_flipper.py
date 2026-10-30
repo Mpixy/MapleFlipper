@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.77"
+VERSION = "0.78"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -708,7 +708,10 @@ def find_cash_badge(img):
         rr, gg, bb = r[y0:y1, x0:x1], g[y0:y1, x0:x1], b[y0:y1, x0:x1]
         orange = ((rr > 190) & (gg > 100) & (gg < 210) & (bb < 90)).sum()
         inner = (r[y:y + h, x:x + w] > 200) & (g[y:y + h, x:x + w] > 150)  # the 'C'
-        if orange >= w and inner.sum() >= 6:
+        # a real coin sits in the tooltip: its dark blue is right of the picture (the REQ lines)
+        side = a[y:y + h, x + w + 20:x + w + 110]
+        navy = ((side[..., 0] - side[..., 2] > 25) & (side.max(axis=2) < 200)).mean() if side.size else 0
+        if orange >= w and inner.sum() >= 6 and navy > 0.5:
             return int(cen[i][0]), int(cen[i][1])
     return None
 
@@ -1508,6 +1511,8 @@ start "" "{sys.executable}"
                     if not btn:
                         tried = None
                         continue
+                    if self.redetect:  # the saved layout didn't fit: look at this same shop again
+                        self.redetect, tried = False, None
                     tried = tried or []
                     if any(abs(btn[0] - t[0]) < 40 and abs(btn[1] - t[1]) < 40 for t in tried):
                         continue  # already looked here (NPC shop / not a shop)
@@ -1808,12 +1813,13 @@ start "" "{sys.executable}"
                         lines = ocr(img)
                         fresh = find_shop_items(lines)
                         if len(fresh) > len(items) + last_faded:
+                            # the list box itself is off (rows outside it): find the shop again
                             dlog("layout_off", fast=len(items), full=len(fresh), stuck=stuck)
-                            if self.layout_try:
-                                self.cfg.pop("layout2", None)
-                            self.rows = shop_rows(lines)
-                            got = read_rows(img, self.rows, seed=True, worth=self.worth)
-                            items = got or items
+                            self.cfg.pop("layout2", None)
+                            self.layout_try = False
+                            self.shop_box, self.rows, self.redetect = None, [], True
+                            self.busy = False
+                            return
                         self.incomplete_since = time.time()
                     if self.layout_try:
                         self.layout_try = False
