@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.74"
+VERSION = "0.75"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -763,6 +763,37 @@ def white_title(img, x0, y0, x1, y1):
     # some versions give the words one by one: put them back together, left to right
     words = sorted(((r[0][0][0] if len(r) == 3 else 0), r[-2]) for r in res or [] if isinstance(r[-2], str))
     return re.sub(r"^[^A-Za-z0-9]+", "", " ".join(w for _, w in words)).strip()
+
+
+TOTAL_LINE = re.compile(r"total\s*price\s*is\s*(\d[\d,. ]*)", re.I)  # ('7 ,670': the reader adds spaces)
+
+
+def find_dialog(img):
+    """The game's blue question box ('Are you sure you want to buy it?' / 'The total price is
+    7,670 mesos.'): its box in the BGR image, or None."""
+    import cv2
+    a = img[::2, ::2].astype(np.int16)
+    b, g, r = a[..., 0], a[..., 1], a[..., 2]
+    m = ((abs(b - 187) < 14) & (abs(g - 136) < 14) & (abs(r - 70) < 16)).astype(np.uint8)
+    n, _, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        if w >= 120 and h >= 25 and area >= 0.6 * w * h:
+            return int(x * 2), int(y * 2), int(w * 2), int(h * 2)
+    return None
+
+
+def dialog_total(img):
+    """'The total price is 7,670 mesos.' -> 7670 (None: no such box on the screen)"""
+    box = find_dialog(img)
+    if not box:
+        return None
+    x, y, w, h = box
+    for o in ocr(np.ascontiguousarray(img[y:y + h, x:x + w])):
+        hit = TOTAL_LINE.search(o["text"])
+        if hit:
+            return to_int(hit.group(1))
+    return None
 
 
 def covered(img, rect):
@@ -1664,6 +1695,16 @@ start "" "{sys.executable}"
                 if (raw, price) != getattr(self, "selected", (None, None, 0))[:2]:
                     dlog("selected", read=raw, price=price)
                 self.selected = (raw, price, time.time())
+                # buying several: 'The total price is 7,670 mesos.' - read it once per box
+                box = find_dialog(screen)
+                if box and (box, raw) != getattr(self, "total_box", None):
+                    total = dialog_total(screen)
+                    if total:
+                        self.total_box = (box, raw)
+                        self.total = (total, time.time())
+                        dlog("total", read=raw, price=price, total=total)
+                elif not box:
+                    self.total_box = None
                 return
 
     # ---- shop scan
@@ -2353,7 +2394,8 @@ start "" "{sys.executable}"
         self.root.after(0, self.refresh)
         self.root.after(0, self.show_banner)
         res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
-        fix = f" (the shop read {price:,} - fixed)" if price != spent else ""
+        fix = (f" ({qty} × {price // max(qty, 1):,})" if price and spent % price == 0 and qty > 1
+               else f" (the shop read {price:,} - fixed)" if price != spent else "")
         self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
 
     def learn_from_mesos(self, diff):
@@ -2370,10 +2412,14 @@ start "" "{sys.executable}"
                 fits = sel_price and (spent % sel_price == 0 and spent // sel_price <= 20
                                       or lost_digits(str(sel_price), str(spent))
                                       or abs(spent - sel_price) <= 0.1 * sel_price)
-                if hit and fits and hit[0][1][0]:
-                    self.selected = (None, None, 0)
-                    dlog("bought_selected", read=raw, price=sel_price, paid=spent)
-                    self.mark_bought(hit[0][0], hit[0][1], spent)
+                total, tt = getattr(self, "total", (None, 0))
+                exact = total == spent and time.time() - tt < 30  # the box said so: certain
+                if hit and (fits or exact) and hit[0][1][0]:
+                    self.selected, self.total = (None, None, 0), (None, 0)
+                    key, v = hit[0]
+                    n = spent // sel_price if spent % sel_price == 0 else 1  # how many you bought
+                    dlog("bought_selected", read=raw, price=sel_price, paid=spent, n=n, sure=exact)
+                    self.mark_bought(key, (v[0], v[1], v[2] * n, v[3]), spent)
                     return
             cands = [(k, v) for k, v in self.seen.items() if v[0] and k not in self.bought_keys]
             hit = [kv for kv in cands if kv[1][3] == spent]
