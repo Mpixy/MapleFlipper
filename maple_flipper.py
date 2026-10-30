@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.65"
+VERSION = "0.66"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -724,6 +724,33 @@ def tooltip_title(img, badge):
     return re.sub(r"^[^A-Za-z0-9]+", "", read_line(np.ascontiguousarray(clean)) or "").strip()
 
 
+def cursor_title(img, cx, cy):
+    """The name at the top of the tooltip the game shows under the mouse (cursor in image
+    pixels): the tooltip's title sits 45-95 px below and right of the pointer."""
+    import cv2
+    crop = img[max(cy + 25, 0):max(cy + 110, 0), max(cx - 10, 0):cx + 380]
+    if crop.size == 0:
+        return ""
+    white = crop.min(axis=2) > 215
+    rows = np.where(white.sum(axis=1) >= 3)[0]
+    band = None
+    # blocks of white lines, top first: the title is the first one that is wide like text
+    # (the white glove of the mouse pointer is narrow)
+    for block in np.split(rows, np.where(np.diff(rows) > 3)[0] + 1) if len(rows) else []:
+        cols = np.where(white[block[0]:block[-1] + 1].any(axis=0))[0]
+        px = crop[block[0]:block[-1] + 1, cols[0]:cols[-1] + 1].astype(np.int16)
+        navy = ((px[..., 0] - px[..., 2] > 25) & (px.max(axis=2) < 190)).mean()
+        # white letters on the dark blue tooltip, not a white window (the chat box) behind it
+        if len(block) >= 8 and cols[-1] - cols[0] >= 50 and navy > 0.4:
+            band = white[max(block[0] - 3, 0):block[-1] + 4]
+            break
+    if band is None:
+        return ""
+    clean = np.where(band[..., None], 255, 40).astype(np.uint8).repeat(3, 2)
+    clean = cv2.resize(clean, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    return re.sub(r"^[^A-Za-z0-9]+", "", read_line(np.ascontiguousarray(clean)) or "").strip()
+
+
 def parse_market(doc):
     """meso.watch's market file (data/list.json or data/market.json: {"items": [...]}) ->
     ({item: [typical low, typical high]}, {cash shop item names}). The typical range is the
@@ -1381,6 +1408,7 @@ start "" "{sys.executable}"
                     btn = find_shop_button(screen[:, :, ::-1])  # screen grabs are BGR
                     try:
                         self.check_cash(screen)
+                        self.check_tooltip(screen, mon)
                     except Exception as e:
                         log_error(type(e), e, e.__traceback__)
                     v = shop_mesos(screen, btn) if btn else None
@@ -1600,6 +1628,35 @@ start "" "{sys.executable}"
             self.names = self.all_names()
             self.say(f"Learned: '{item}' is an NX (cash) item - NPCs don't buy it.")
             self.root.after(0, self.rematch)
+
+    def check_tooltip(self, screen, mon):
+        """The mouse rests on a shop row and the game shows its tooltip: the tooltip's title is
+        the item's exact name. When the row's own text was read as something else, learn the
+        right name for that text - every item, not only NX ones. (Only looks: GetCursorPos.)"""
+        import ctypes.wintypes
+        pt = ctypes.wintypes.POINT()
+        if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            return
+        cx, cy = pt.x - mon["left"], pt.y - mon["top"]
+        row = next((raw for (x, y, w, h), raw in getattr(self, "row_spots", [])
+                    if y <= pt.y <= y + h and x - 60 <= pt.x <= x + w), None)
+        if not row or (row, cx // 20, cy // 20) == getattr(self, "tip_last", None):
+            return
+        title = cursor_title(screen, cx, cy)
+        if not title:
+            return
+        self.tip_last = (row, cx // 20, cy // 20)
+        real, score = match_name(title, self.names, self.learned)
+        was, _ = match_name(row, self.names, self.learned)
+        dlog("tooltip", row=row, title=title, item=real, score=score, was=was)
+        # the title must really be a known item (a clean read), and must look like the row
+        if not real or score < 90 or real == was:
+            return
+        if Levenshtein.distance(norm(row), norm(real)) > max(3, len(norm(real)) // 3):
+            return  # the tooltip of another row (the mouse moved on): don't trust it
+        self.learned.alias(row, real)
+        self.say(f"Learned from the tooltip: '{row}' is '{real}'.")
+        self.root.after(0, self.rematch)
 
     # ---- shop scan
     def visible_win(self):
@@ -1861,6 +1918,9 @@ start "" "{sys.executable}"
                 if k not in self.bought_keys and self.seen_shop.get(k) == self.cur_shop:
                     self.seen.pop(k, None)
                     self.count.pop(k, None)
+        if mark_box and rects and len(rects) == len(items):  # where each row is on the screen (tooltips)
+            self.row_spots = [((mark_box["left"] + x, mark_box["top"] + y, w, h), it[0])
+                              for (x, y, w, h), it in zip(rects, items)]
         if mark_box and mark_box is self.shop_box:
             self.draw_marks(mark_box, marks)
         profits = [p for _, p in marks if isinstance(p, int)]
