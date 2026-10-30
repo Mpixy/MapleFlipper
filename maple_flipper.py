@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.68"
+VERSION = "0.69"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1579,6 +1579,9 @@ start "" "{sys.executable}"
     def cheap(self, v):
         """Under 80% of the lowest of the last 20 prices seen before it? -> (unit price, that lowest)"""
         real, _, qty, price = v
+        pays = self.npc_pays(real, qty) if real else None
+        if pays is not None and price <= pays * 1.1:
+            return None  # about what an NPC pays anyway: the seller dumps it at the NPC price, no deal
         if real in self.learned.market and qty:  # a price you typed in
             low = self.learned.market[real][0]
             return (price / qty, low) if price / qty < CHEAP * low else None
