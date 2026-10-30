@@ -25,9 +25,9 @@ sys.modules["winsound"] = types.SimpleNamespace(MessageBeep=lambda *_: None, MB_
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 import maple_flipper as mf  # noqa: E402
-from read_test import SHOPS, HERE, same  # noqa: E402
+from read_test import SHOPS, ENDS, HERE, same  # noqa: E402
 
-order = os.environ.get("ORDER", "7.png 8.png 9.png 11.png 13.png 10.png 14.png 5.png 9.png 7.png").split()
+order = os.environ.get("ORDER", "7.png 8.png 9.png 11.png 13.png 10.png 14.png 5.png 15.png 9.png 7.png").split()
 current = {"img": None}
 
 
@@ -85,10 +85,14 @@ def script():
                 if hit:
                     left.remove(hit)
             if app.cur_shop is not None and not wrong and len(left) <= may_miss and (got or not real) \
-                    and time.time() - t > 2:
+                    and time.time() - t > 2 and bool(getattr(app, "page_end", False)) == (name in ENDS):
                 break
             time.sleep(0.2)
         ok = not wrong and len(left) <= may_miss
+        end = bool(getattr(app, "page_end", False))
+        if end != (name in ENDS):
+            ok = False
+            print(f"     end of list: app says {end}, really {name in ENDS}")
         print(f"{'ok  ' if ok else 'FAIL'} {name} ({time.time() - t:.1f}s): {len(got)}/{len(real)}"
               + (f" WRONG {wrong}" if wrong else "") + (f" missed {left}" if left else ""))
         if not ok:

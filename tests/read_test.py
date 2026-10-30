@@ -46,6 +46,10 @@ SHOPS = {
     "14.png": ([], 0),
 }
 
+SHOPS["15.png"] = ([("Earring DEX Scroll: Inter...", 55999), ("Pet Equip Jump Scroll: Gr...", 4999)], 0)
+# the list ends on this page (empty slots under the last row): the app may say DONE
+ENDS = {"9.png", "10.png", "13.png", "14.png"}
+
 
 def same(read, real):
     a, b = mf.norm(read.rstrip(".… ")), mf.norm(real.rstrip(".… "))
