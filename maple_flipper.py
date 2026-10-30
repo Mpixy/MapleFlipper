@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.72"
+VERSION = "0.73"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1417,6 +1417,7 @@ start "" "{sys.executable}"
                     try:
                         self.check_cash(screen)
                         self.check_tooltip(screen, mon)
+                        self.check_selected(screen, mon)
                     except Exception as e:
                         log_error(type(e), e, e.__traceback__)
                     v = shop_mesos(screen, btn) if btn else None
@@ -1630,7 +1631,7 @@ start "" "{sys.executable}"
         if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
             return
         cx, cy = pt.x - mon["left"], pt.y - mon["top"]
-        row = next((raw for (x, y, w, h), raw in getattr(self, "row_spots", [])
+        row = next((raw for (x, y, w, h), raw, _ in getattr(self, "row_spots", [])
                     if y <= pt.y <= y + h and x - 60 <= pt.x <= x + w), None)
         if not row or (row, cx // 20, cy // 20) == getattr(self, "tip_last", None):
             return
@@ -1649,6 +1650,21 @@ start "" "{sys.executable}"
         self.learned.alias(row, real)
         self.say(f"Learned from the tooltip: '{row}' is '{real}'.")
         self.root.after(0, self.rematch)
+
+    def check_selected(self, screen, mon):
+        """The row you clicked turns orange (and stays so while 'Are you sure you want to buy
+        it?' is up): remember it - when your mesos go down, that is exactly what you bought."""
+        for (x, y, w, h), raw, price in getattr(self, "row_spots", []):
+            x, y = x - mon["left"] + 50, y - mon["top"]  # (the text only, not the icon)
+            px = screen[max(y, 0):y + h, max(x, 0):x + w - 50].astype(np.int16)
+            if px.size == 0:
+                continue
+            b, g, r = px[..., 0], px[..., 1], px[..., 2]
+            if ((r > 200) & (g > 120) & (g < 190) & (b < 90)).mean() > 0.4:
+                if (raw, price) != getattr(self, "selected", (None, None, 0))[:2]:
+                    dlog("selected", read=raw, price=price)
+                self.selected = (raw, price, time.time())
+                return
 
     # ---- shop scan
     def visible_win(self):
@@ -1941,7 +1957,7 @@ start "" "{sys.executable}"
                     self.seen.pop(k, None)
                     self.count.pop(k, None)
         if mark_box and rects and len(rects) == len(items):  # where each row is on the screen (tooltips)
-            self.row_spots = [((mark_box["left"] + x, mark_box["top"] + y, w, h), it[0])
+            self.row_spots = [((mark_box["left"] + x, mark_box["top"] + y, w, h), it[0], it[2])
                               for (x, y, w, h), it in zip(rects, items)]
         if mark_box and mark_box is self.shop_box:
             self.draw_marks(mark_box, marks)
@@ -2345,6 +2361,20 @@ start "" "{sys.executable}"
         and correct the prices automatically."""
         if diff < 0:
             spent = -diff
+            raw, sel_price, t = getattr(self, "selected", (None, None, 0))
+            if raw and time.time() - t < 30:
+                # the row you selected (orange) before the mesos went down: that's the purchase.
+                # The price only has to fit loosely (a misread digit / several bundles at once)
+                hit = [(k, v) for k, v in self.seen.items() if v[1] == raw and v[3] == sel_price
+                       and k not in self.bought_keys]
+                fits = sel_price and (spent % sel_price == 0 and spent // sel_price <= 20
+                                      or lost_digits(str(sel_price), str(spent))
+                                      or abs(spent - sel_price) <= 0.1 * sel_price)
+                if hit and fits and hit[0][1][0]:
+                    self.selected = (None, None, 0)
+                    dlog("bought_selected", read=raw, price=sel_price, paid=spent)
+                    self.mark_bought(hit[0][0], hit[0][1], spent)
+                    return
             cands = [(k, v) for k, v in self.seen.items() if v[0] and k not in self.bought_keys]
             hit = [kv for kv in cands if kv[1][3] == spent]
             if not hit:  # bought 2+ of the same bundle at once
