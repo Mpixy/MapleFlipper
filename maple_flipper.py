@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.75"
+VERSION = "0.76"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -41,6 +41,7 @@ MARKET_FILE = os.path.join(DATA, "market_seen.json")  # item -> the last 20 pric
 MARKET_KEEP = 20  # prices remembered per item
 MARKET_MIN = 5  # prices needed before the app compares (fewer says too little)
 CHEAP = 0.8  # under 80% of the lowest of those prices = a blue 'cheap' alert
+CHEAP_NX = 0.75  # NX items and scrolls: under 75%
 CHEAP_SAVE = 1000  # ...and at least this much under it (94 instead of 125 is no news)
 REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
 RELEASE = "https://github.com/Mpixy/MapleFlipper/releases/download/latest/"
@@ -1050,7 +1051,8 @@ def pick_region(root, callback):
 
 HELP_TEXT = """BLUE = CHEAP
  The app remembers the last 20 prices it saw for every item, in every shop you open.
- A blue row / frame + a quiet tik = this shop sells it under 80% of the LOWEST of those 20
+ A blue row / frame + a quiet tik = this shop sells it under 80% (NX items and scrolls: 75%)
+ of the LOWEST of those 20
  (it starts comparing once it has 5 prices, and only for 1,000+ mesos under it).
  Then that price joins the 20, so the lowest moves.
  The 'NPC pays' column shows: low <lowest> (<how many prices>).
@@ -1611,28 +1613,43 @@ start "" "{sys.executable}"
     def is_nx(self, item):
         return bool(item) and item in self.learned.nx
 
+    def market_name(self, v):
+        """The name prices are kept under: the item, or - for one not in the item list (a scroll
+        whose name the shop cuts: 'Cape Weapon Def. Scroll:...') - the text as the shop shows it."""
+        real, raw = v[0], v[1]
+        if real:
+            return real
+        raw = re.sub(r"[.…\s]+$", "", raw or "")
+        return raw + "..." if len(norm(raw)) >= 8 else None
+
+    def cheap_factor(self, name):
+        return CHEAP_NX if self.is_nx(name) or "scroll" in norm(name or "") else CHEAP
+
     def cheap(self, v):
-        """Under 80% of the lowest of the last 20 prices seen before it? -> (unit price, that lowest)"""
+        """Under 80% (NX / scrolls: 75%) of the lowest of the last 20 prices seen before it?
+        -> (unit price, that lowest)"""
         real, _, qty, price = v
         pays = self.npc_pays(real, qty) if real else None
         if pays is not None and price <= pays * 1.1:
             return None  # about what an NPC pays anyway: the seller dumps it at the NPC price, no deal
         if real in self.learned.market and qty:  # a price you typed in
             low = self.learned.market[real][0]
-            got = (price / qty, low) if price / qty < CHEAP * low else None
+            got = (price / qty, low) if price / qty < self.cheap_factor(real) * low else None
         else:
             got = self.cheap_ref.get((real_key(v), self.seen_shop.get(real_key(v), self.cur_shop)))
         return got[:2] if got and (got[1] - got[0]) * qty >= CHEAP_SAVE else None
 
     def judge_price(self, key, v):
         """The first time a row is seen: compare it with the prices from before, then add it."""
-        real, _, qty, price = v
-        if not real or not qty or (key, self.cur_shop) in self.cheap_ref:
+        _, _, qty, price = v
+        name = self.market_name(v)
+        if not name or not qty or (key, self.cur_shop) in self.cheap_ref:
             return False
         unit = round(price / qty)
-        rng = self.market_range(real)
-        self.cheap_ref[key, self.cur_shop] = (unit, rng[0], rng[2]) if rng and unit < CHEAP * rng[0] else None
-        return self.see_price(real, unit)
+        rng = self.market_range(name)
+        self.cheap_ref[key, self.cur_shop] = ((unit, rng[0], rng[2]) if rng and unit < self.cheap_factor(name) * rng[0]
+                                              else None)
+        return self.see_price(name, unit)
 
     def check_cash(self, screen):
         """A tooltip with the red C coin is on the screen: whatever item it shows is NX. Learned
@@ -2077,7 +2094,7 @@ start "" "{sys.executable}"
         elif cheap:
             v, (unit, low) = cheap[0]
             more = f"  (+{len(cheap) - 1} more)" if len(cheap) > 1 else ""
-            self.set_banner(f"🔵 CHEAP: {v[0]}  for {v[3]:,}  (lowest seen {low:,}){more}{eye}", "#2b8cff", "#fff")
+            self.set_banner(f"🔵 CHEAP: {v[0] or v[1]}  for {v[3]:,}  (lowest seen {low:,}){more}{eye}", "#2b8cff", "#fff")
         elif watched:
             v = watched[0]
             self.set_banner(f"👀 WATCHED: {v[0] or v[1]}  for {v[3]:,}" + (f"  (+{len(watched) - 1} more)"
@@ -2217,13 +2234,13 @@ start "" "{sys.executable}"
                 odd = key in self.odd_name
                 vals, tag = (f"{real or raw} ({'name' if odd else 'price'}?)", qty, f"{price:,}" + ("" if odd else " ?"),
                              "-" if pays is None else f"{pays:,}", "check name" if odd else "check price", shop), "unsure"
-            elif p is None and (self.is_nx(real) or self.cheap(v) or self.market_range(real)):
+            elif p is None and (self.is_nx(real) or self.cheap(v) or self.market_range(self.market_name(v))):
                 ch = self.cheap(v)
-                rng = self.market_range(real)
-                vals = (f"{'💎 ' if self.is_nx(real) else ''}{real}{times}", qty, f"{price:,}",
+                rng = self.market_range(self.market_name(v))
+                vals = (f"{'💎 ' if self.is_nx(real) else ''}{real or raw}{times}", qty, f"{price:,}",
                         "NX - no NPC" if self.is_nx(real) else "unknown",
                         f"low {rng[0]:,} ({rng[2]})" if rng else "-", shop)
-                tag = "cheap" if ch else "nx"
+                tag = "cheap" if ch else "nx" if self.is_nx(real) else "unknown"
             elif p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
             else:
