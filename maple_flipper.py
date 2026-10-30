@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.67"
+VERSION = "0.68"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -37,9 +37,10 @@ LOG_FILE = os.path.join(DATA, "mesos_log.csv")
 LEARN_FILE = os.path.join(DATA, "learned.json")
 STATS_FILE = os.path.join(DATA, "flips.json")
 SHOPS_FILE = os.path.join(DATA, "shops.json")  # shops you visited: seller -> when, best profit
-MARKET_FILE = os.path.join(DATA, "market.json")  # player-market prices: item -> [typical low, typical high]
-MARKET_URLS = ("https://meso.watch/data/list.json", "https://meso.watch/data/market.json")
-CHEAP = 0.8  # a shop price under 80% of the typical market range = a blue 'cheap' alert
+MARKET_FILE = os.path.join(DATA, "market_seen.json")  # item -> the last 20 prices seen in shops [unit, shop, when]
+MARKET_KEEP = 20  # prices remembered per item
+MARKET_MIN = 5  # prices needed before the app compares (fewer says too little)
+CHEAP = 0.8  # under 80% of the lowest of those prices = a blue 'cheap' alert
 REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
 RELEASE = "https://github.com/Mpixy/MapleFlipper/releases/download/latest/"
 FROZEN = getattr(sys, "frozen", False)  # running as MapleFlipper.exe
@@ -773,24 +774,6 @@ def covered(img, rect):
     return ((blue > 60) | ((blue > 35) & (px.max(axis=2) < 150))).mean() > 0.15
 
 
-def parse_market(doc):
-    """meso.watch's market file (data/list.json or data/market.json: {"items": [...]}) ->
-    ({item: [typical low, typical high]}, {cash shop item names}). The typical range is the
-    middle half of the recent sales (p25-p75); an item with under 5 sales: its lowest-highest."""
-    out, cash = {}, set()
-    for it in (doc or {}).get("items") or []:
-        name = it.get("name")
-        if not name:
-            continue
-        if it.get("cash"):
-            cash.add(name)
-        few = (it.get("priceSales") or it.get("sold") or 0) < 5
-        lo, hi = (it.get("low"), it.get("high")) if few or it.get("p25") is None else (it.get("p25"), it.get("p75"))
-        if lo:
-            out[name] = [int(lo), int(hi or lo)]
-    return out, cash
-
-
 VOLUME = [0.3]  # 0..1, the volume slider
 
 
@@ -1033,11 +1016,12 @@ def pick_region(root, callback):
 
 # ---------------------------------------------------------------- app
 
-HELP_TEXT = """BLUE = CHEAP (meso.watch)
- A blue row / frame = under 80% of the item's typical player price on meso.watch, with a quiet tik.
- Prices load by themselves. If meso.watch blocks the app: open meso.watch/data/list.json in your
- browser, Ctrl+S to save it, then 'Market file' and pick that file.
- 💎 = NX item (NPCs don't buy it) - learned from the red C coin in the tooltip and from meso.watch.
+HELP_TEXT = """BLUE = CHEAP
+ The app remembers the last 20 prices it saw for every item, in every shop you open.
+ A blue row / frame + a quiet tik = this shop sells it under 80% of the LOWEST of those 20
+ (it starts comparing once it has 5 prices). Then that price joins the 20, so the lowest moves.
+ The 'NPC pays' column shows: low <lowest> (<how many prices>).
+ 💎 = NX item (NPCs don't buy it) - learned from the red C coin in the tooltip.
 
 FIND PROFITABLE ITEMS
 1. Walk into a player shop in the game.
@@ -1145,7 +1129,8 @@ class App:
         MEM = Memory()
         dlog("start", version=VERSION, prices=len(self.prices), learned=len(self.learned.prices),
              memory_prices=len(MEM.price), memory_icons=len(MEM.icon))
-        self.market = load_json(MARKET_FILE, {})  # meso.watch typical ranges
+        self.market = load_json(MARKET_FILE, {})  # prices seen in shops: item -> [[unit, shop, when], ...]
+        self.cheap_ref = {}  # (item key, shop) -> (unit price, lowest seen before it, how many) when it is cheap, else None
         self.cheap_seen = set()  # (item key, shop) already pinged as cheap
         self.badge_last = None
         self.names = self.all_names()
@@ -1189,7 +1174,6 @@ class App:
             self.say(f"Fixed {len(self.wild)} wrongly learned prices (back to MeowDB): {', '.join(self.wild[:8])}")
         if not os.path.isdir(os.path.join(HERE, ".git")):  # (a developer's copy updates with git)
             self.root.after(3000, self.check_update)
-        threading.Thread(target=self.update_market, daemon=True).start()
         if self.cfg.get("tracking") and self.cfg.get("meso_area"):
             self.root.after(800, self.toggle_track)  # was tracking last time: keep going
         if not self.cfg.get("seen_help"):
@@ -1252,7 +1236,6 @@ class App:
         vol.bind("<ButtonRelease-1>", lambda e: (self.cfg.__setitem__("volume", self.volume.get()),
                                                  save_json(CONFIG_FILE, self.cfg), soft_ping()))
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
-        ttk.Button(bar, text="Market file", command=self.market_file).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
         ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
         ttk.Button(bar, text="Shops", command=self.shops_window).pack(side="right", padx=(0, 6))
@@ -1563,74 +1546,54 @@ start "" "{sys.executable}"
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
                 self.say(f"Price update failed: {e} - progress is saved, it will continue next time.")
-            self.update_market()
             self.updating = False
 
         threading.Thread(target=work, daemon=True).start()
 
     def all_names(self):
-        return sorted(set(self.prices) | set(self.learned.prices) | set(self.market)
-                      | set(self.learned.market) | self.learned.nx)
-
-    def update_market(self):
-        """Typical player-market ranges from meso.watch -> market.json (kept if the site is down)."""
-        for url in MARKET_URLS:
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=30)
-                r.raise_for_status()
-                if self.use_market(r.json(), "meso.watch"):
-                    dlog("market", url=url, items=len(self.market))
-                    return
-            except Exception as e:
-                dlog("market", url=url, error=str(e))
-        self.say(f"meso.watch didn't let the app download its prices. Using the {len(self.market):,} saved "
-                 "before - or press 'Market file' (Help explains).")
-
-    def use_market(self, doc, where):
-        got, cash = parse_market(doc)
-        if not got:
-            return False
-        self.market = got
-        save_json(MARKET_FILE, got)
-        new_nx = cash - self.learned.nx - set(self.learned.prices)  # an NPC paid for it: not NX after all
-        if new_nx:
-            self.learned.nx |= new_nx
-            self.learned.save()
-        self.names = self.all_names()
-        self.say(f"Market prices updated: {len(got):,} items, {len(cash):,} NX items ({where}).")
-        self.root.after(0, self.rematch)
-        return True
-
-    def market_file(self):
-        """A market file saved from the browser (meso.watch/data/list.json -> Ctrl+S)."""
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(parent=self.root, title="meso.watch list.json",
-                                          filetypes=[("JSON", "*.json"), ("All files", "*.*")])
-        if not path:
-            return
-        try:
-            with open(path, encoding="utf-8") as f:
-                doc = json.load(f)
-        except Exception as e:
-            messagebox.showerror("Market file", f"Couldn't read that file: {e}")
-            return
-        if not self.use_market(doc, "file"):
-            messagebox.showerror("Market file", "No item prices in that file - it has to be meso.watch/data/list.json.")
+        return sorted(set(self.prices) | set(self.learned.prices) | set(self.learned.market) | self.learned.nx)
 
     def market_range(self, item):
-        return self.learned.market.get(item) or self.market.get(item) if item else None
+        """(lowest, highest, how many) of the prices you typed in, or of the last 20 seen in shops."""
+        if not item:
+            return None
+        if item in self.learned.market:
+            lo, hi = self.learned.market[item]
+            return lo, hi, MARKET_KEEP
+        seen = [u for u, _, _ in self.market.get(item, [])]
+        return (min(seen), max(seen), len(seen)) if len(seen) >= MARKET_MIN else None
+
+    def see_price(self, item, unit):
+        """Remember a price seen in a shop (the same shop at the same price counts once);
+        only the last 20 are kept, so the lowest moves with the market."""
+        lst = self.market.setdefault(item, [])
+        if any(s == self.cur_shop and u == unit for u, s, _ in lst):
+            return False
+        lst.append([unit, self.cur_shop, int(time.time())])
+        del lst[:-MARKET_KEEP]
+        return True
 
     def is_nx(self, item):
         return bool(item) and item in self.learned.nx
 
     def cheap(self, v):
-        """Under 80% of the typical market range? -> (unit price in the shop, typical low)"""
+        """Under 80% of the lowest of the last 20 prices seen before it? -> (unit price, that lowest)"""
         real, _, qty, price = v
+        if real in self.learned.market and qty:  # a price you typed in
+            low = self.learned.market[real][0]
+            return (price / qty, low) if price / qty < CHEAP * low else None
+        got = self.cheap_ref.get((real_key(v), self.seen_shop.get(real_key(v), self.cur_shop)))
+        return got[:2] if got else None
+
+    def judge_price(self, key, v):
+        """The first time a row is seen: compare it with the prices from before, then add it."""
+        real, _, qty, price = v
+        if not real or not qty or (key, self.cur_shop) in self.cheap_ref:
+            return False
+        unit = round(price / qty)
         rng = self.market_range(real)
-        if not rng or not qty:
-            return None
-        unit = price / qty
-        return (unit, rng[0]) if unit < CHEAP * rng[0] else None
+        self.cheap_ref[key, self.cur_shop] = (unit, rng[0], rng[2]) if rng and unit < CHEAP * rng[0] else None
+        return self.see_price(real, unit)
 
     def check_cash(self, screen):
         """A tooltip with the red C coin is on the screen: whatever item it shows is NX. Learned
@@ -1860,6 +1823,7 @@ start "" "{sys.executable}"
 
     def apply_scan(self, items, rects, mark_box, auto, took):
         new_good, new_watch, new_cheap, marks, page = False, [], [], [], {}
+        market_new = False
         keep = [i for i, it in enumerate(items) if not ignored(it[0])]  # arrows: never worth anything
         if rects:
             rects = [rects[i] for i in keep]
@@ -1900,6 +1864,8 @@ start "" "{sys.executable}"
             if watched and (key, self.cur_shop) not in self.watch_seen:
                 self.watch_seen.add((key, self.cur_shop))
                 new_watch.append(v)
+            if sure and self.judge_price(key, v):
+                market_new = True
             cheap = sure and not good and self.cheap(v)
             if cheap and (key, self.cur_shop) not in self.cheap_seen:
                 self.cheap_seen.add((key, self.cur_shop))
@@ -1918,6 +1884,8 @@ start "" "{sys.executable}"
                  profit=self.profit(v) if v else None, odd=key in self.odd_name, watched=self.watched(real or name))
         if MEM:
             MEM.save()
+        if market_new:
+            save_json(MARKET_FILE, self.market)
         if items:  # rows that just left the list (a mesos drop may come a moment later)
             van = self.__dict__.setdefault("vanished", {})
             for k in prev_page - self.on_page:
@@ -2028,7 +1996,7 @@ start "" "{sys.executable}"
         elif cheap:
             v, (unit, low) = cheap[0]
             more = f"  (+{len(cheap) - 1} more)" if len(cheap) > 1 else ""
-            self.set_banner(f"🔵 CHEAP: {v[0]}  for {v[3]:,}  (market ~{low:,}+){more}{eye}", "#2b8cff", "#fff")
+            self.set_banner(f"🔵 CHEAP: {v[0]}  for {v[3]:,}  (lowest seen {low:,}){more}{eye}", "#2b8cff", "#fff")
         elif watched:
             v = watched[0]
             self.set_banner(f"👀 WATCHED: {v[0] or v[1]}  for {v[3]:,}" + (f"  (+{len(watched) - 1} more)"
@@ -2168,12 +2136,12 @@ start "" "{sys.executable}"
                 odd = key in self.odd_name
                 vals, tag = (f"{real or raw} ({'name' if odd else 'price'}?)", qty, f"{price:,}" + ("" if odd else " ?"),
                              "-" if pays is None else f"{pays:,}", "check name" if odd else "check price", shop), "unsure"
-            elif p is None and (self.is_nx(real) or self.cheap(v)):
+            elif p is None and (self.is_nx(real) or self.cheap(v) or self.market_range(real)):
                 ch = self.cheap(v)
                 rng = self.market_range(real)
                 vals = (f"{'💎 ' if self.is_nx(real) else ''}{real}{times}", qty, f"{price:,}",
                         "NX - no NPC" if self.is_nx(real) else "unknown",
-                        f"market {rng[0]:,}-{rng[1]:,}" if rng else "-", shop)
+                        f"low {rng[0]:,} ({rng[2]})" if rng else "-", shop)
                 tag = "cheap" if ch else "nx"
             elif p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
@@ -2221,7 +2189,7 @@ start "" "{sys.executable}"
             else:
                 m.add_command(label=f"💎 '{real}' is an NX item (NPCs don't buy it)",
                               command=lambda: (self.learned.mark_nx(real), self.refresh()))
-            m.add_command(label=f"Set typical market price of '{real}'...", command=lambda: self.ask_market(real))
+            m.add_command(label=f"Set market price of '{real}' by hand...", command=lambda: self.ask_market(real))
             if real in self.learned.prices:
                 m.add_command(label="Forget what was learned for this item",
                               command=lambda: (self.learned.forget(real), self.rematch()))
@@ -2639,9 +2607,9 @@ start "" "{sys.executable}"
         best = max((p for _, p in marks if isinstance(p, int)), default=None)
         for (x, y, rw, rh), p in marks:
             x += pad
-            if isinstance(p, tuple):  # under 80% of the meso.watch range
+            if isinstance(p, tuple):  # under 80% of the lowest price seen lately
                 c.create_rectangle(x, y, x + rw, y + rh, outline="#2b8cff", width=3)
-                c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"CHEAP (~{p[1]:,})",
+                c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"CHEAP (low {p[1]:,})",
                               fill="#2b8cff", font=("Segoe UI", 11, "bold"))
                 continue
             if p is None:  # an item on your watch list
