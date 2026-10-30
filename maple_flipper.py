@@ -2394,7 +2394,7 @@ start "" "{sys.executable}"
         self.root.after(0, self.refresh)
         self.root.after(0, self.show_banner)
         res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
-        fix = (f" ({qty} × {price // max(qty, 1):,})" if price and spent % price == 0 and qty > 1
+        fix = (f" ({qty} × {price:,})" if qty > 1 and spent == price * qty
                else f" (the shop read {price:,} - fixed)" if price != spent else "")
         self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
 
