@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.64"
+VERSION = "0.65"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1831,6 +1831,28 @@ start "" "{sys.executable}"
                  profit=self.profit(v) if v else None, odd=key in self.odd_name, watched=self.watched(real or name))
         if MEM:
             MEM.save()
+        if items:  # rows that just left the list (a mesos drop may come a moment later)
+            van = self.__dict__.setdefault("vanished", {})
+            for k in prev_page - self.on_page:
+                if k in self.seen:
+                    van[k] = (time.time(), self.seen[k], self.cur_shop)
+            for k in [k for k, x in van.items() if time.time() - x[0] > 15]:
+                del van[k]
+        ps = getattr(self, "pending_spend", None)
+        if ps and items and (time.time() - ps[1] > 20 or ps[2] != self.cur_shop):
+            self.pending_spend = ps = None  # too late / another shop: it was something else
+        if ps:
+            spent, _, _, before = ps
+            gone = [k for k in before - self.on_page if k in self.seen and k not in self.bought_keys
+                    and self.seen[k][3] <= spent]
+            if len(gone) == 1:  # your mesos went down and exactly one row left the list: that one
+                self.pending_spend = None
+                k = gone[0]
+                if self.seen[k][0]:
+                    self.mark_bought(k, self.seen[k], spent)
+                else:  # (a row whose name was never read: just stop showing it)
+                    self.seen.pop(k, None)
+                dlog("bought_by_gone", item=k[0], paid=spent)
         # the same page again with an item missing from the middle: it was bought (by you or
         # someone else). Missing at the top / bottom is just scrolling.
         gone = {k for k in prev_page - self.on_page if k in prev_order[1:-1]}
@@ -2095,6 +2117,8 @@ start "" "{sys.executable}"
         if real:
             m.add_command(label=f"Wrong item - it is NOT '{real}'", command=lambda: self.fix_item(v, wrong=True))
         m.add_command(label="Pick the correct item...", command=lambda: self.fix_item(v))
+        if real and real_key(v) not in self.bought_keys:
+            m.add_command(label="✔ I already bought this", command=lambda: self.mark_bought(real_key(v), v, price))
         if self.watched(real or raw):
             m.add_command(label=f"✖ Stop watching '{real or raw}'", command=lambda: self.unwatch(real or raw))
         else:
@@ -2200,6 +2224,40 @@ start "" "{sys.executable}"
                 self.unsure.add(key)
         self.refresh()
 
+    def mark_bought(self, key, v, spent):
+        """You bought this row (mesos went down by `spent`): stop suggesting it, wait for the NPC sale."""
+        real, raw, qty, price = v
+        p = self.profit((real, raw, qty, spent))
+        if (p is None or p <= 0) and not self.watched(real):
+            # bought for yourself (no profit selling it to an NPC): not a flip, don't track it
+            dlog("bought_not_flip", item=real, paid=spent, profit=p)
+            self.seen.pop(key, None)
+            self.root.after(0, self.refresh)
+            return
+        if price != spent:  # show what you really paid
+            self.seen.pop(key, None)
+            self.unsure.discard(key)
+            v = (real, raw, qty, spent)
+            key = real_key(v)
+            self.seen[key] = v
+            self.seen_shop.setdefault(key, self.cur_shop)
+        self.seen.setdefault(key, v)  # (a row that already left the list: show it as bought)
+        self.bought_keys[key] = spent
+        dlog("bought", item=real, read=raw, shop_price=price, paid=spent)
+        if MEM:
+            MEM.bought[real] = MEM.bought.get(real, 0) + 1
+            MEM.dirty = True
+        if self.seen_shop.get(key):
+            self.stats.setdefault("from", {})[real] = self.seen_shop[key]
+        pays = self.npc_pays(real, qty)
+        self.bought.append([real, raw, qty, pays, spent])
+        self.save_stats()
+        self.root.after(0, self.refresh)
+        self.root.after(0, self.show_banner)
+        res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
+        fix = f" (the shop read {price:,} - fixed)" if price != spent else ""
+        self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
+
     def learn_from_mesos(self, diff):
         """Buying from a shop and selling to an NPC show up as mesos changes: use them to check
         and correct the prices automatically."""
@@ -2213,38 +2271,20 @@ start "" "{sys.executable}"
                 hit = [kv for kv in cands if lost_digits(str(kv[1][3]), str(spent))]
             if len(hit) != 1 and not any(kv[1][3] == spent for kv in hit):
                 dlog("spent_unmatched", spent=spent, candidates=[kv[1][0] for kv in hit])
+                van = [(k, x[1]) for k, x in getattr(self, "vanished", {}).items()
+                       if time.time() - x[0] < 10 and x[2] == self.cur_shop and k not in self.bought_keys
+                       and x[1][0] and x[1][3] <= spent]
+                if len(van) == 1:  # a row left the list just before the mesos went down: that one
+                    self.vanished.pop(van[0][0], None)
+                    self.mark_bought(van[0][0], van[0][1], spent)
+                    return
+                # the price didn't say which row it was: the row that disappears from the shop
+                # list in the next seconds will (see apply_scan). Re-read the list right away.
+                self.pending_spend = (spent, time.time(), self.cur_shop, set(self.on_page))
+                self.scanned = None
                 return
             key, v = next((kv for kv in hit if kv[1][3] == spent), hit[0])
-            real, raw, qty, price = v
-            p = self.profit((real, raw, qty, spent))
-            if (p is None or p <= 0) and not self.watched(real):
-                # bought for yourself (no profit selling it to an NPC): not a flip, don't track it
-                dlog("bought_not_flip", item=real, paid=spent, profit=p)
-                self.seen.pop(key, None)
-                self.root.after(0, self.refresh)
-                return
-            if price != spent:  # show what you really paid
-                self.seen.pop(key, None)
-                self.unsure.discard(key)
-                v = (real, raw, qty, spent)
-                key = real_key(v)
-                self.seen[key] = v
-                self.seen_shop.setdefault(key, self.cur_shop)
-            self.bought_keys[key] = spent
-            dlog("bought", item=real, read=raw, shop_price=price, paid=spent)
-            if MEM:
-                MEM.bought[real] = MEM.bought.get(real, 0) + 1
-                MEM.dirty = True
-            if self.seen_shop.get(key):
-                self.stats.setdefault("from", {})[real] = self.seen_shop[key]
-            pays = self.npc_pays(real, qty)
-            self.bought.append([real, raw, qty, pays, spent])
-            self.save_stats()
-            self.root.after(0, self.refresh)
-            self.root.after(0, self.show_banner)
-            res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
-            fix = f" (the shop read {price:,} - fixed)" if price != spent else ""
-            self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
+            self.mark_bought(key, v, spent)
             return
         if not self.bought:
             return
