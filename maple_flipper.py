@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.76"
+VERSION = "0.77"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -797,6 +797,31 @@ def dialog_total(img):
     return None
 
 
+def scroll_pos(img, btn):
+    """Where the shop list's scrollbar thumb is: (top, bottom) as 0..1 of the track, or None."""
+    bx, by = int(btn[0]), int(btn[1])
+    x0, x1, y0, y1 = max(bx + 40, 0), bx + 200, max(by + 60, 0), by + 700
+    a = img[y0:y1, x0:x1].astype(np.int16)
+    grey = (abs(a[..., 0] - 231) < 8) & (abs(a[..., 1] - 231) < 8) & (abs(a[..., 2] - 231) < 8)
+    if not grey.size:
+        return None
+    col = int(np.argmax(grey.sum(axis=0)))
+    g = grey[:, col]
+    if g.sum() < 40:
+        return None
+    ys = np.where(g)[0]
+    top, bot = ys[0], ys[-1]
+    # the thumb: the part of the track that isn't grey; at the very ends it can hide one end
+    b, r = a[top:bot + 8, col, 0], a[top:bot + 8, col, 2]
+    thumb = np.where((~g[top:bot + 8]) & (b - r > 30))[0]
+    if not len(thumb):
+        return None
+    run = np.split(thumb, np.where(np.diff(thumb) > 2)[0] + 1)[0]  # the thumb, not the arrow under it
+    thumb = run
+    end = bot + 8 - top  # approx track length incl. a thumb sitting at the very bottom
+    return thumb[0] / end, (thumb[-1] + 1) / end
+
+
 def covered(img, rect):
     """Is the dark blue tooltip lying over this row (so its text can't be read)?"""
     x, y, w, h = rect
@@ -804,7 +829,7 @@ def covered(img, rect):
     if px.size == 0:
         return False
     blue = px[..., 0] - px[..., 2]  # (the rows' own pale blue-grey is under 30)
-    return ((blue > 60) | ((blue > 35) & (px.max(axis=2) < 150))).mean() > 0.15
+    return ((blue > 60) | ((blue > 35) & (px.max(axis=2) < 150))).mean() > 0.3
 
 
 VOLUME = [0.3]  # 0..1, the volume slider
@@ -1454,6 +1479,9 @@ start "" "{sys.executable}"
                     except Exception as e:
                         log_error(type(e), e, e.__traceback__)
                     v = shop_mesos(screen, btn) if btn else None
+                    if btn:
+                        sp = scroll_pos(screen, btn)
+                        self.root.after(0, self.show_progress, int(btn[0]) + mon["left"], int(btn[1]) + mon["top"], sp)
                     if v is not None:  # your mesos in the shop window: 2 equal reads in a row
                         self.shop_mesos_t = time.time()
                         m_hits = m_hits + 1 if v == m_pending else 1
@@ -1469,6 +1497,7 @@ start "" "{sys.executable}"
                         misses = 0
                         self.shop_box, last, tried = None, None, None
                         self.root.after(0, self.hide_marks)
+                        self.root.after(0, self.hide_progress)
                         self.root.after(0, self.left_shop)
                         self.say("Shop closed - waiting for the next shop.")
                         continue
@@ -1854,8 +1883,11 @@ start "" "{sys.executable}"
                 if rects and base is not None and len(rects) == len(items):
                     # rows under the game's tooltip read as garbage ('ourist', 'Orange BaseaRE'): skip them
                     # (only the text: a blue item icon is not a tooltip)
-                    keep = [i for i, (x, y, w, h) in enumerate(rects) if not covered(base, (x + 50, y, w - 50, h))]
+                    # (the name and price only: not the scrollbar next to them)
+                    keep = [i for i, (x, y, w, h) in enumerate(rects) if not covered(base, (x + 50, y, 230, h))]
                     hidden = len(items) - len(keep)
+                    if hidden:
+                        dlog("hidden_rows", rows=[items[i][0] for i in range(len(items)) if i not in keep])
                     items, rects = [items[i] for i in keep], [rects[i] for i in keep]
                 # a row hidden (mouse cursor, tooltip): re-read as soon as anything moves
                 was = self.incomplete
@@ -2740,6 +2772,51 @@ start "" "{sys.executable}"
             c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"{'★ ' if top else ''}+{p:,}",
                           fill="#e09000" if top else "#00c000", font=("Segoe UI", 12 if top else 11, "bold"))
 
+    def show_progress(self, bx, by, sp):
+        """A small sign over the seller: how far down the list you've read, and DONE when the
+        whole shop has been read (bottom of the list, nothing left unread on the page)."""
+        if not self.show_marks.get():
+            return self.hide_progress()
+        # the scrollbar's thumb: where in the list you are (no scrollbar = one page only)
+        if sp:
+            self.shop_low = max(getattr(self, "shop_low", 0), sp[1])
+        low = self.shop_low if sp else 1.0
+        reading = self.busy or self.incomplete or not self.rows
+        done = low >= 0.97 and not reading
+        if done:
+            text, color = "✔ DONE - next shop", "#00c000"
+        elif reading:
+            text, color = f"📖 reading... {int(low * 100)}%", "#e0a000"
+        else:
+            text, color = f"▼ scroll down  {int(low * 100)}%", "#2b8cff"
+        if not getattr(self, "prog_win", None):
+            w = tk.Toplevel(self.root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            w.configure(bg="#ff00ff")
+            try:
+                w.attributes("-transparentcolor", "#ff00ff")
+            except tk.TclError:
+                pass
+            self.prog_lbl = tk.Label(w, bg="#ff00ff", font=("Segoe UI", 12, "bold"))
+            self.prog_lbl.pack()
+            w.update_idletasks()
+            try:  # clicks go through to the game
+                hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+                ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
+            except Exception:
+                pass
+            self.prog_win = w
+        self.prog_lbl.config(text=text, fg=color)
+        self.prog_win.geometry(f"+{bx - 330}+{by - 125}")  # over the seller's character
+        self.prog_win.deiconify()
+
+    def hide_progress(self):
+        self.shop_low = 0
+        if getattr(self, "prog_win", None):
+            self.prog_win.withdraw()
+
     def hide_marks(self):
         if getattr(self, "overlay", None):
             self.overlay.withdraw()
@@ -2796,6 +2873,7 @@ start "" "{sys.executable}"
         """Another shop: drop the losers of the previous ones, keep the profitable items
         until they are bought."""
         missed = self.left_shop()
+        self.shop_low = 0  # (the progress sign starts again)
         dlog("shop", seller=seller, revisit=bool(self.known_shop(seller)))
         for key, v in list(self.seen.items()):
             p = self.profit(v)
