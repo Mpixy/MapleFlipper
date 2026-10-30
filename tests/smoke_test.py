@@ -21,7 +21,8 @@ ctypes.windll = types.SimpleNamespace(  # Windows API stand-ins
     shcore=types.SimpleNamespace(SetProcessDpiAwareness=lambda *_: 0),
     user32=types.SimpleNamespace(GetAsyncKeyState=lambda *_: 0, GetParent=lambda *_: 0,
                                  GetWindowLongW=lambda *_: 0, SetWindowLongW=lambda *_: 0))
-sys.modules["winsound"] = types.SimpleNamespace(MessageBeep=lambda *_: None, MB_ICONASTERISK=0)
+sys.modules["winsound"] = types.SimpleNamespace(MessageBeep=lambda *_: None, MB_ICONASTERISK=0, PlaySound=lambda *_: None,
+                                                SND_FILENAME=0, SND_ASYNC=0, SND_NODEFAULT=0)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import maple_flipper as mf  # noqa: E402
 

@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.61"
+VERSION = "0.65"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -37,6 +37,9 @@ LOG_FILE = os.path.join(DATA, "mesos_log.csv")
 LEARN_FILE = os.path.join(DATA, "learned.json")
 STATS_FILE = os.path.join(DATA, "flips.json")
 SHOPS_FILE = os.path.join(DATA, "shops.json")  # shops you visited: seller -> when, best profit
+MARKET_FILE = os.path.join(DATA, "market.json")  # player-market prices: item -> [typical low, typical high]
+MARKET_URLS = ("https://meso.watch/data/list.json", "https://meso.watch/data/market.json")
+CHEAP = 0.8  # a shop price under 80% of the typical market range = a blue 'cheap' alert
 REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
 RELEASE = "https://github.com/Mpixy/MapleFlipper/releases/download/latest/"
 FROZEN = getattr(sys, "frozen", False)  # running as MapleFlipper.exe
@@ -322,10 +325,20 @@ class Learned:
         self.aliases = d.get("aliases", {})
         self.blocked = d.get("blocked", {})
         self.manual = set(d.get("manual", []))  # prices the user typed in: always trusted
+        self.nx = set(d.get("nx", []))  # cash (NX) items: seen with the red C coin, NPCs don't buy them
+        self.market = d.get("market", {})  # typical market range the user typed in: item -> [low, high]
 
     def save(self):
         save_json(LEARN_FILE, {"prices": self.prices, "aliases": self.aliases,
-                               "blocked": self.blocked, "manual": sorted(self.manual)})
+                               "blocked": self.blocked, "manual": sorted(self.manual),
+                               "nx": sorted(self.nx), "market": self.market})
+
+    def mark_nx(self, item):
+        if item not in self.nx:
+            self.nx.add(item)
+            self.save()
+            return True
+        return False
 
     def drop_wild(self, db):
         """Forget learned prices that are 3x off MeowDB: those came from a sale matched to the
@@ -351,6 +364,7 @@ class Learned:
 
     def set_price(self, item, unit_price):
         self.prices[item] = unit_price
+        self.nx.discard(item)  # an NPC paid for it: not a cash item
         self.save()
 
     def forget(self, item):
@@ -674,6 +688,92 @@ def seller_name(img, btn):
     return read_line(np.ascontiguousarray(cv2.cvtColor(text, cv2.COLOR_GRAY2BGR))).strip(" .")
 
 
+def find_cash_badge(img):
+    """The red 'C' coin the game draws on a cash (NX) item's picture in its tooltip (BGR screen
+    grab). Returns the coin's centre, or None. Red disk + orange rim + light 'C' inside - the
+    red/white target on the 'Hit Me' shirt has no orange rim, so it doesn't count."""
+    import cv2
+    a = img.astype(np.int16)
+    b, g, r = a[..., 0], a[..., 1], a[..., 2]
+    red = ((r > 170) & (g < 80) & (b < 80)).astype(np.uint8)
+    n, _, st, cen = cv2.connectedComponentsWithStats(red, connectivity=8)
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        if not (18 <= w <= 50 and 18 <= h <= 50 and 0.75 <= w / h <= 1.33 and 0.3 <= area / (w * h) <= 0.9):
+            continue
+        y0, y1, x0, x1 = max(y - 4, 0), y + h + 4, max(x - 4, 0), x + w + 4
+        rr, gg, bb = r[y0:y1, x0:x1], g[y0:y1, x0:x1], b[y0:y1, x0:x1]
+        orange = ((rr > 190) & (gg > 100) & (gg < 210) & (bb < 90)).sum()
+        inner = (r[y:y + h, x:x + w] > 200) & (g[y:y + h, x:x + w] > 150)  # the 'C'
+        if orange >= w and inner.sum() >= 6:
+            return int(cen[i][0]), int(cen[i][1])
+    return None
+
+
+def tooltip_title(img, badge):
+    """The tooltip's first line (the item's name), about 120 px above the coin."""
+    bx, by = badge
+    crop = img[max(by - 145, 0):max(by - 100, 0), max(bx - 120, 0):bx + 280]
+    if crop.size == 0:
+        return ""
+    import cv2
+    # only the bright white title letters: the chat window shows through the see-through tooltip
+    white = crop.min(axis=2) > 215
+    clean = np.where(white[..., None], 255, 40).astype(np.uint8).repeat(3, 2)
+    clean = cv2.resize(clean, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    return re.sub(r"^[^A-Za-z0-9]+", "", read_line(np.ascontiguousarray(clean)) or "").strip()
+
+
+def parse_market(doc):
+    """meso.watch's market file (data/list.json or data/market.json: {"items": [...]}) ->
+    ({item: [typical low, typical high]}, {cash shop item names}). The typical range is the
+    middle half of the recent sales (p25-p75); an item with under 5 sales: its lowest-highest."""
+    out, cash = {}, set()
+    for it in (doc or {}).get("items") or []:
+        name = it.get("name")
+        if not name:
+            continue
+        if it.get("cash"):
+            cash.add(name)
+        few = (it.get("priceSales") or it.get("sold") or 0) < 5
+        lo, hi = (it.get("low"), it.get("high")) if few or it.get("p25") is None else (it.get("p25"), it.get("p75"))
+        if lo:
+            out[name] = [int(lo), int(hi or lo)]
+    return out, cash
+
+
+VOLUME = [0.3]  # 0..1, the volume slider
+
+
+def play(notes, ms=100):
+    """Play a few short tones at the slider's volume (winsound.Beep is always full blast).
+    The tones become a small WAV file, played without waiting."""
+    import winsound
+    import wave
+    if VOLUME[0] <= 0:
+        return
+    rate = 22050
+    t = np.arange(int(rate * ms / 1000)) / rate
+    fade = np.minimum(1, np.minimum(t, t[::-1]) * 200)  # no clicks at the start / end
+    wav = np.concatenate([np.sin(2 * np.pi * f * t) * fade for f in notes])
+    wav = (wav * 32000 * VOLUME[0] ** 2).astype(np.int16)  # squared: the slider feels even
+    path = os.path.join(DATA, f"sound-{'-'.join(map(str, notes))}-{ms}-{int(VOLUME[0] * 100)}.wav")
+    if os.path.exists(path):  # (never rewrite a file that may be playing right now)
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+        return
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(wav.tobytes())
+    winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+
+
+def soft_ping():
+    """A short, quiet 'tik' for a cheap market find."""
+    play([1320], 60)
+
+
 def ago(t):
     m = int((time.time() - t) // 60)
     return "just now" if m < 1 else f"{m} min ago" if m < 60 else f"{m // 60}h {m % 60:02d}m ago"
@@ -884,7 +984,13 @@ def pick_region(root, callback):
 
 # ---------------------------------------------------------------- app
 
-HELP_TEXT = """FIND PROFITABLE ITEMS
+HELP_TEXT = """BLUE = CHEAP (meso.watch)
+ A blue row / frame = under 80% of the item's typical player price on meso.watch, with a quiet tik.
+ Prices load by themselves. If meso.watch blocks the app: open meso.watch/data/list.json in your
+ browser, Ctrl+S to save it, then 'Market file' and pick that file.
+ 💎 = NX item (NPCs don't buy it) - learned from the red C coin in the tooltip and from meso.watch.
+
+FIND PROFITABLE ITEMS
 1. Walk into a player shop in the game.
 2. Press F8 (or the big SCAN button).
 3. Green rows = buy it and sell it to any NPC for profit.
@@ -990,7 +1096,10 @@ class App:
         MEM = Memory()
         dlog("start", version=VERSION, prices=len(self.prices), learned=len(self.learned.prices),
              memory_prices=len(MEM.price), memory_icons=len(MEM.icon))
-        self.names = sorted(set(self.prices) | set(self.learned.prices))
+        self.market = load_json(MARKET_FILE, {})  # meso.watch typical ranges
+        self.cheap_seen = set()  # (item key, shop) already pinged as cheap
+        self.badge_last = None
+        self.names = self.all_names()
         self.seen = {}
         self.seen_shop = {}  # item key -> seller name
         self.unsure = set()  # item keys whose price was read differently twice: never 'profitable'
@@ -1031,6 +1140,7 @@ class App:
             self.say(f"Fixed {len(self.wild)} wrongly learned prices (back to MeowDB): {', '.join(self.wild[:8])}")
         if not os.path.isdir(os.path.join(HERE, ".git")):  # (a developer's copy updates with git)
             self.root.after(3000, self.check_update)
+        threading.Thread(target=self.update_market, daemon=True).start()
         if self.cfg.get("tracking") and self.cfg.get("meso_area"):
             self.root.after(800, self.toggle_track)  # was tracking last time: keep going
         if not self.cfg.get("seen_help"):
@@ -1084,7 +1194,16 @@ class App:
         ttk.Checkbutton(bar, text="Auto", variable=self.auto).pack(side="left", padx=(0, 6))
         self.beep = tk.BooleanVar(value=self.cfg.get("beep", True))
         ttk.Checkbutton(bar, text="Beep", variable=self.beep).pack(side="left")
+        self.volume = tk.IntVar(value=self.cfg.get("volume", 30))
+        VOLUME[0] = self.volume.get() / 100
+        ttk.Label(bar, text="🔊").pack(side="left", padx=(6, 0))
+        vol = ttk.Scale(bar, from_=0, to=100, length=70, variable=self.volume,
+                        command=lambda v: VOLUME.__setitem__(0, float(v) / 100))
+        vol.pack(side="left")
+        vol.bind("<ButtonRelease-1>", lambda e: (self.cfg.__setitem__("volume", self.volume.get()),
+                                                 save_json(CONFIG_FILE, self.cfg), soft_ping()))
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
+        ttk.Button(bar, text="Market file", command=self.market_file).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
         ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
         ttk.Button(bar, text="Shops", command=self.shops_window).pack(side="right", padx=(0, 6))
@@ -1106,6 +1225,8 @@ class App:
         self.tree.tag_configure("unknown", foreground="#c07000")
         self.tree.tag_configure("unsure", background="#ffe7a8")
         self.tree.tag_configure("watch", background="#e7d4f7")
+        self.tree.tag_configure("cheap", background="#c7e2ff")
+        self.tree.tag_configure("nx", foreground="#7a5cc0")
         self.tree.tag_configure("bought", background="#9cc8ff", font=("Segoe UI", 9, "bold"))
         self.tree.pack(fill="both", expand=True, padx=8, pady=6)
         self.tree.bind("<Double-1>", self.open_item)
@@ -1258,6 +1379,10 @@ start "" "{sys.executable}"
                     checked = time.time()
                     screen = grab()
                     btn = find_shop_button(screen[:, :, ::-1])  # screen grabs are BGR
+                    try:
+                        self.check_cash(screen)
+                    except Exception as e:
+                        log_error(type(e), e, e.__traceback__)
                     v = shop_mesos(screen, btn) if btn else None
                     if v is not None:  # your mesos in the shop window: 2 equal reads in a row
                         self.shop_mesos_t = time.time()
@@ -1380,7 +1505,7 @@ start "" "{sys.executable}"
                 except Exception:  # no release yet: fall back to reading MeowDB directly
                     found, total = update_prices(self.say)
                 self.prices = load_prices()
-                self.names = list(self.prices)
+                self.names = self.all_names()
                 if found == 0:
                     self.say("Could not read prices from MeowDB. Send update_log.txt (in %LOCALAPPDATA%\\MapleFlipper) to Claude.")
                 else:
@@ -1388,9 +1513,93 @@ start "" "{sys.executable}"
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
                 self.say(f"Price update failed: {e} - progress is saved, it will continue next time.")
+            self.update_market()
             self.updating = False
 
         threading.Thread(target=work, daemon=True).start()
+
+    def all_names(self):
+        return sorted(set(self.prices) | set(self.learned.prices) | set(self.market)
+                      | set(self.learned.market) | self.learned.nx)
+
+    def update_market(self):
+        """Typical player-market ranges from meso.watch -> market.json (kept if the site is down)."""
+        for url in MARKET_URLS:
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=30)
+                r.raise_for_status()
+                if self.use_market(r.json(), "meso.watch"):
+                    dlog("market", url=url, items=len(self.market))
+                    return
+            except Exception as e:
+                dlog("market", url=url, error=str(e))
+        self.say(f"meso.watch didn't let the app download its prices. Using the {len(self.market):,} saved "
+                 "before - or press 'Market file' (Help explains).")
+
+    def use_market(self, doc, where):
+        got, cash = parse_market(doc)
+        if not got:
+            return False
+        self.market = got
+        save_json(MARKET_FILE, got)
+        new_nx = cash - self.learned.nx - set(self.learned.prices)  # an NPC paid for it: not NX after all
+        if new_nx:
+            self.learned.nx |= new_nx
+            self.learned.save()
+        self.names = self.all_names()
+        self.say(f"Market prices updated: {len(got):,} items, {len(cash):,} NX items ({where}).")
+        self.root.after(0, self.rematch)
+        return True
+
+    def market_file(self):
+        """A market file saved from the browser (meso.watch/data/list.json -> Ctrl+S)."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self.root, title="meso.watch list.json",
+                                          filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Market file", f"Couldn't read that file: {e}")
+            return
+        if not self.use_market(doc, "file"):
+            messagebox.showerror("Market file", "No item prices in that file - it has to be meso.watch/data/list.json.")
+
+    def market_range(self, item):
+        return self.learned.market.get(item) or self.market.get(item) if item else None
+
+    def is_nx(self, item):
+        return bool(item) and item in self.learned.nx
+
+    def cheap(self, v):
+        """Under 80% of the typical market range? -> (unit price in the shop, typical low)"""
+        real, _, qty, price = v
+        rng = self.market_range(real)
+        if not rng or not qty:
+            return None
+        unit = price / qty
+        return (unit, rng[0]) if unit < CHEAP * rng[0] else None
+
+    def check_cash(self, screen):
+        """A tooltip with the red C coin is on the screen: whatever item it shows is NX. Learned
+        for good, by name - next time that item is shown as NX (no NPC price), not as '?'."""
+        badge = find_cash_badge(screen)
+        if not badge:
+            self.badge_last = None
+            return
+        if self.badge_last and abs(badge[0] - self.badge_last[0]) < 4 and abs(badge[1] - self.badge_last[1]) < 4:
+            return  # the same tooltip as a moment ago
+        self.badge_last = badge
+        title = tooltip_title(screen, badge)
+        real, _ = match_name(title, self.names, self.learned) if title else (None, 0)
+        item = real or (title if len(norm(title)) >= 4 else None)
+        dlog("nx", read=title, item=item, at=badge)
+        if item and item not in self.learned.prices and self.learned.mark_nx(item):
+            self.names = self.all_names()
+            self.say(f"Learned: '{item}' is an NX (cash) item - NPCs don't buy it.")
+            self.root.after(0, self.rematch)
 
     # ---- shop scan
     def visible_win(self):
@@ -1563,7 +1772,7 @@ start "" "{sys.executable}"
         return None if u is None else npc_value(item, u, qty)
 
     def apply_scan(self, items, rects, mark_box, auto, took):
-        new_good, new_watch, marks, page = False, [], [], {}
+        new_good, new_watch, new_cheap, marks, page = False, [], [], [], {}
         keep = [i for i, it in enumerate(items) if not ignored(it[0])]  # arrows: never worth anything
         if rects:
             rects = [rects[i] for i in keep]
@@ -1604,8 +1813,14 @@ start "" "{sys.executable}"
             if watched and (key, self.cur_shop) not in self.watch_seen:
                 self.watch_seen.add((key, self.cur_shop))
                 new_watch.append(v)
+            cheap = sure and not good and self.cheap(v)
+            if cheap and (key, self.cur_shop) not in self.cheap_seen:
+                self.cheap_seen.add((key, self.cur_shop))
+                new_cheap.append(v)
             if rects and (good or watched):
                 marks.append((rects[i], p if good else None))
+            elif rects and cheap:
+                marks.append((rects[i], ("cheap", cheap[1])))
         self.count.update(page)
         for name, qty, price, sure in items:
             real, score = match_name(name, self.names, self.learned)
@@ -1616,6 +1831,28 @@ start "" "{sys.executable}"
                  profit=self.profit(v) if v else None, odd=key in self.odd_name, watched=self.watched(real or name))
         if MEM:
             MEM.save()
+        if items:  # rows that just left the list (a mesos drop may come a moment later)
+            van = self.__dict__.setdefault("vanished", {})
+            for k in prev_page - self.on_page:
+                if k in self.seen:
+                    van[k] = (time.time(), self.seen[k], self.cur_shop)
+            for k in [k for k, x in van.items() if time.time() - x[0] > 15]:
+                del van[k]
+        ps = getattr(self, "pending_spend", None)
+        if ps and items and (time.time() - ps[1] > 20 or ps[2] != self.cur_shop):
+            self.pending_spend = ps = None  # too late / another shop: it was something else
+        if ps:
+            spent, _, _, before = ps
+            gone = [k for k in before - self.on_page if k in self.seen and k not in self.bought_keys
+                    and self.seen[k][3] <= spent]
+            if len(gone) == 1:  # your mesos went down and exactly one row left the list: that one
+                self.pending_spend = None
+                k = gone[0]
+                if self.seen[k][0]:
+                    self.mark_bought(k, self.seen[k], spent)
+                else:  # (a row whose name was never read: just stop showing it)
+                    self.seen.pop(k, None)
+                dlog("bought_by_gone", item=k[0], paid=spent)
         # the same page again with an item missing from the middle: it was bought (by you or
         # someone else). Missing at the top / bottom is just scrolling.
         gone = {k for k in prev_page - self.on_page if k in prev_order[1:-1]}
@@ -1626,7 +1863,7 @@ start "" "{sys.executable}"
                     self.count.pop(k, None)
         if mark_box and mark_box is self.shop_box:
             self.draw_marks(mark_box, marks)
-        profits = [p for _, p in marks if p is not None]
+        profits = [p for _, p in marks if isinstance(p, int)]
         best = max(profits, default=0)
         if new_good:
             self.found_today += sum(profits)
@@ -1634,16 +1871,14 @@ start "" "{sys.executable}"
             v = new_watch[0]
             self.say(f"👀 WATCHED ITEM: {v[0] or v[1]} for {v[3]:,} at {self.cur_shop or 'this shop'}!")
             if self.beep.get():
-                import winsound
-                threading.Thread(target=lambda: [winsound.Beep(f, 120) for f in (1000, 750, 1000, 750)],
-                                 daemon=True).start()
+                play([1000, 750, 1000, 750], 120)
         elif new_good and self.beep.get():
-            import winsound
             if best >= max(10000, 10 * self.min_p()):  # jackpot: a little fanfare
-                threading.Thread(target=lambda: [winsound.Beep(f, 90) for f in (660, 880, 1320)],
-                                 daemon=True).start()
+                play([660, 880, 1320], 90)
             else:
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                play([880, 1100], 80)
+        elif new_cheap and self.beep.get():
+            soft_ping()  # just a quiet tik for a cheap market find
         self.show_banner()
         if new_watch or (new_good and best >= max(10000, 10 * self.min_p())):
             self.flash(8 if new_watch else 6)
@@ -1681,6 +1916,8 @@ start "" "{sys.executable}"
         watched = [v for k, v in self.seen.items() if self.seen_shop.get(k) == self.cur_shop
                    and k not in self.bought_keys and self.watched(v[0] or v[1])]
         here = [(p, v) for p, v in here if p is not None and p > 0 and p >= self.min_p()]
+        cheap = [(v, self.cheap(v)) for k, v in self.seen.items() if self.seen_shop.get(k) == self.cur_shop
+                 and k not in self.unsure and k not in self.bought_keys and self.cheap(v)]
         eye = "   👀 " + ", ".join(f"{v[0] or v[1]} {v[3]:,}" for v in watched[:2]) if watched else ""
         if here:
             # what you can click right now first, then the rest of the shop
@@ -1698,6 +1935,10 @@ start "" "{sys.executable}"
             times = f" ×{n}" if n > 1 else ""
             self.set_banner(f"{'💰' if hot else '✅'} BUY: {v[0]}{times}  for {v[3]:,}  →  +{p:,}{where}{more}{eye}",
                             "#ffd23f" if hot else "#2fb344", "#000" if hot else "#fff")
+        elif cheap:
+            v, (unit, low) = cheap[0]
+            more = f"  (+{len(cheap) - 1} more)" if len(cheap) > 1 else ""
+            self.set_banner(f"🔵 CHEAP: {v[0]}  for {v[3]:,}  (market ~{low:,}+){more}{eye}", "#2b8cff", "#fff")
         elif watched:
             v = watched[0]
             self.set_banner(f"👀 WATCHED: {v[0] or v[1]}  for {v[3]:,}" + (f"  (+{len(watched) - 1} more)"
@@ -1742,6 +1983,15 @@ start "" "{sys.executable}"
             save_json(CONFIG_FILE, self.cfg)
             self.refresh()
             self.say(f"👀 Watching '{item}' from now on.")
+
+    def unwatch(self, item):
+        n = norm(item)
+        self.watch = [w for w in self.watch if not (w and norm(w) in n)]
+        self.cfg["watch"] = self.watch
+        save_json(CONFIG_FILE, self.cfg)
+        self.refresh()
+        self.show_banner()
+        self.say(f"Stopped watching '{item}'.")
 
     def complain(self):
         """F11: something looks wrong right now - keep a full screenshot and mark the log, so
@@ -1828,13 +2078,20 @@ start "" "{sys.executable}"
                 odd = key in self.odd_name
                 vals, tag = (f"{real or raw} ({'name' if odd else 'price'}?)", qty, f"{price:,}" + ("" if odd else " ?"),
                              "-" if pays is None else f"{pays:,}", "check name" if odd else "check price", shop), "unsure"
+            elif p is None and (self.is_nx(real) or self.cheap(v)):
+                ch = self.cheap(v)
+                rng = self.market_range(real)
+                vals = (f"{'💎 ' if self.is_nx(real) else ''}{real}{times}", qty, f"{price:,}",
+                        "NX - no NPC" if self.is_nx(real) else "unknown",
+                        f"market {rng[0]:,}-{rng[1]:,}" if rng else "-", shop)
+                tag = "cheap" if ch else "nx"
             elif p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
             else:
                 mark = " ✓" if real in self.learned.prices else ""
                 prof = f"{p:+,}" + (f" ×{n}" if n > 1 and p > 0 else "")
                 vals = (real + times, qty, f"{price:,}", f"{self.npc_pays(real, qty):,}{mark}", prof, shop)
-                tag = "good" if p > 0 and p >= self.min_p() else "bad"
+                tag = "good" if p > 0 and p >= self.min_p() else "cheap" if self.cheap(v) else "bad"
             if watched and tag != "bought":
                 vals = ("👀 " + vals[0],) + vals[1:]
                 if tag != "good":
@@ -1860,9 +2117,21 @@ start "" "{sys.executable}"
         if real:
             m.add_command(label=f"Wrong item - it is NOT '{real}'", command=lambda: self.fix_item(v, wrong=True))
         m.add_command(label="Pick the correct item...", command=lambda: self.fix_item(v))
-        m.add_command(label=f"👀 Watch '{real or raw}'", command=lambda: self.watch_item(real or raw))
+        if real and real_key(v) not in self.bought_keys:
+            m.add_command(label="✔ I already bought this", command=lambda: self.mark_bought(real_key(v), v, price))
+        if self.watched(real or raw):
+            m.add_command(label=f"✖ Stop watching '{real or raw}'", command=lambda: self.unwatch(real or raw))
+        else:
+            m.add_command(label=f"👀 Watch '{real or raw}'", command=lambda: self.watch_item(real or raw))
         if real:
             m.add_command(label=f"Set real NPC price of '{real}'...", command=lambda: self.ask_price(real))
+            if self.is_nx(real):
+                m.add_command(label=f"'{real}' is NOT an NX item",
+                              command=lambda: (self.learned.nx.discard(real), self.learned.save(), self.refresh()))
+            else:
+                m.add_command(label=f"💎 '{real}' is an NX item (NPCs don't buy it)",
+                              command=lambda: (self.learned.mark_nx(real), self.refresh()))
+            m.add_command(label=f"Set typical market price of '{real}'...", command=lambda: self.ask_market(real))
             if real in self.learned.prices:
                 m.add_command(label="Forget what was learned for this item",
                               command=lambda: (self.learned.forget(real), self.rematch()))
@@ -1922,6 +2191,23 @@ start "" "{sys.executable}"
             self.say(f"Learned: NPC pays {val:,} for '{item}'.")
             self.refresh()
 
+    def ask_market(self, item):
+        from tkinter import simpledialog
+        rng = self.market_range(item)
+        val = simpledialog.askstring("Typical market price", f"Typical player price of ONE '{item}'\n"
+                                     "(low-high, e.g. 40000-60000; empty = forget):", parent=self.root,
+                                     initialvalue=f"{rng[0]}-{rng[1]}" if rng else "")
+        if val is None:
+            return
+        nums = [to_int(x) for x in re.split(r"[-–~ ]+", val.replace(",", "")) if to_int(x)]
+        if nums:
+            self.learned.market[item] = [min(nums), max(nums)]
+        else:
+            self.learned.market.pop(item, None)
+        self.learned.save()
+        self.refresh()
+        self.show_banner()
+
     def rematch(self):
         """Re-run matching on everything in the list after the app learned something."""
         old = list(self.seen.values())
@@ -1938,6 +2224,40 @@ start "" "{sys.executable}"
                 self.unsure.add(key)
         self.refresh()
 
+    def mark_bought(self, key, v, spent):
+        """You bought this row (mesos went down by `spent`): stop suggesting it, wait for the NPC sale."""
+        real, raw, qty, price = v
+        p = self.profit((real, raw, qty, spent))
+        if (p is None or p <= 0) and not self.watched(real):
+            # bought for yourself (no profit selling it to an NPC): not a flip, don't track it
+            dlog("bought_not_flip", item=real, paid=spent, profit=p)
+            self.seen.pop(key, None)
+            self.root.after(0, self.refresh)
+            return
+        if price != spent:  # show what you really paid
+            self.seen.pop(key, None)
+            self.unsure.discard(key)
+            v = (real, raw, qty, spent)
+            key = real_key(v)
+            self.seen[key] = v
+            self.seen_shop.setdefault(key, self.cur_shop)
+        self.seen.setdefault(key, v)  # (a row that already left the list: show it as bought)
+        self.bought_keys[key] = spent
+        dlog("bought", item=real, read=raw, shop_price=price, paid=spent)
+        if MEM:
+            MEM.bought[real] = MEM.bought.get(real, 0) + 1
+            MEM.dirty = True
+        if self.seen_shop.get(key):
+            self.stats.setdefault("from", {})[real] = self.seen_shop[key]
+        pays = self.npc_pays(real, qty)
+        self.bought.append([real, raw, qty, pays, spent])
+        self.save_stats()
+        self.root.after(0, self.refresh)
+        self.root.after(0, self.show_banner)
+        res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
+        fix = f" (the shop read {price:,} - fixed)" if price != spent else ""
+        self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
+
     def learn_from_mesos(self, diff):
         """Buying from a shop and selling to an NPC show up as mesos changes: use them to check
         and correct the prices automatically."""
@@ -1951,38 +2271,20 @@ start "" "{sys.executable}"
                 hit = [kv for kv in cands if lost_digits(str(kv[1][3]), str(spent))]
             if len(hit) != 1 and not any(kv[1][3] == spent for kv in hit):
                 dlog("spent_unmatched", spent=spent, candidates=[kv[1][0] for kv in hit])
+                van = [(k, x[1]) for k, x in getattr(self, "vanished", {}).items()
+                       if time.time() - x[0] < 10 and x[2] == self.cur_shop and k not in self.bought_keys
+                       and x[1][0] and x[1][3] <= spent]
+                if len(van) == 1:  # a row left the list just before the mesos went down: that one
+                    self.vanished.pop(van[0][0], None)
+                    self.mark_bought(van[0][0], van[0][1], spent)
+                    return
+                # the price didn't say which row it was: the row that disappears from the shop
+                # list in the next seconds will (see apply_scan). Re-read the list right away.
+                self.pending_spend = (spent, time.time(), self.cur_shop, set(self.on_page))
+                self.scanned = None
                 return
             key, v = next((kv for kv in hit if kv[1][3] == spent), hit[0])
-            real, raw, qty, price = v
-            p = self.profit((real, raw, qty, spent))
-            if (p is None or p <= 0) and not self.watched(real):
-                # bought for yourself (no profit selling it to an NPC): not a flip, don't track it
-                dlog("bought_not_flip", item=real, paid=spent, profit=p)
-                self.seen.pop(key, None)
-                self.root.after(0, self.refresh)
-                return
-            if price != spent:  # show what you really paid
-                self.seen.pop(key, None)
-                self.unsure.discard(key)
-                v = (real, raw, qty, spent)
-                key = real_key(v)
-                self.seen[key] = v
-                self.seen_shop.setdefault(key, self.cur_shop)
-            self.bought_keys[key] = spent
-            dlog("bought", item=real, read=raw, shop_price=price, paid=spent)
-            if MEM:
-                MEM.bought[real] = MEM.bought.get(real, 0) + 1
-                MEM.dirty = True
-            if self.seen_shop.get(key):
-                self.stats.setdefault("from", {})[real] = self.seen_shop[key]
-            pays = self.npc_pays(real, qty)
-            self.bought.append([real, raw, qty, pays, spent])
-            self.save_stats()
-            self.root.after(0, self.refresh)
-            self.root.after(0, self.show_banner)
-            res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
-            fix = f" (the shop read {price:,} - fixed)" if price != spent else ""
-            self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
+            self.mark_bought(key, v, spent)
             return
         if not self.bought:
             return
@@ -2244,9 +2546,14 @@ start "" "{sys.executable}"
         self.overlay.deiconify()
         c = self.ov_canvas
         c.delete("all")
-        best = max((p for _, p in marks if p is not None), default=None)
+        best = max((p for _, p in marks if isinstance(p, int)), default=None)
         for (x, y, rw, rh), p in marks:
             x += pad
+            if isinstance(p, tuple):  # under 80% of the meso.watch range
+                c.create_rectangle(x, y, x + rw, y + rh, outline="#2b8cff", width=3)
+                c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"CHEAP (~{p[1]:,})",
+                              fill="#2b8cff", font=("Segoe UI", 11, "bold"))
+                continue
             if p is None:  # an item on your watch list
                 c.create_rectangle(x, y, x + rw, y + rh, outline="#b44dff", width=4)
                 c.create_text(x + rw + 6, y + rh / 2, anchor="w", text="👀 WATCH",
@@ -2280,7 +2587,7 @@ start "" "{sys.executable}"
 
     def on_close_save(self):
         self.cfg.update(tracking=self.tracking, marks=self.show_marks.get(),
-                        geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(),
+                        geometry=self.root.geometry(), min_profit=self.min_p(), beep=self.beep.get(), volume=self.volume.get(),
                         auto=self.auto.get(), mini=self.mini_on)
         self.save_shop()
         if MEM:
@@ -2307,8 +2614,7 @@ start "" "{sys.executable}"
         self.set_banner(f"⚠ MISSED at {shop}: {v[0]} for {v[3]:,} → +{p:,}" +
                         (f"  (+{len(deals) - 1} more)" if len(deals) > 1 else "") + " - go back?", "#ff3b3b", "#fff")
         if self.beep.get():
-            import winsound
-            threading.Thread(target=lambda: [winsound.Beep(f, 140) for f in (880, 660, 440)], daemon=True).start()
+            play([880, 660, 440], 140)
         return True
 
     def new_shop(self, seller):
