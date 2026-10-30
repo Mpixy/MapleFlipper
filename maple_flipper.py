@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.70"
+VERSION = "0.71"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1116,6 +1116,7 @@ class App:
         self.scanned = None
         self.rows = []
         self.incomplete = False
+        self.incomplete_since = 0.0
         self.shop_btn = None
         self.shop_btn_abs = None  # the BUY ITEM button on the screen (for the saved layout)
         self.layout_try = False  # this shop was opened with the saved layout (no text detection)
@@ -1697,6 +1698,20 @@ start "" "{sys.executable}"
                 if box and box is self.shop_box and self.rows:
                     items = read_rows(img, self.rows, worth=self.worth)  # fast: known rows, cached text
                     all_grey = not items and last_faded > 0
+                    stuck = self.incomplete and time.time() - self.incomplete_since > 2.5
+                    if (self.layout_try or stuck) and (items or all_grey):
+                        # check the fast read once against a full read: a saved layout that is a
+                        # bit off reads 1 row of 4 and keeps doing so (Opal Ore never showed up)
+                        lines = ocr(img)
+                        full = find_shop_items(lines)
+                        if len(full) > len(items) + last_faded:
+                            dlog("layout_off", fast=len(items), full=len(full), stuck=stuck)
+                            if self.layout_try:
+                                self.cfg.pop("layout2", None)
+                            self.rows = shop_rows(lines)
+                            got = read_rows(img, self.rows, seed=True, worth=self.worth)
+                            items = got or items
+                        self.incomplete_since = time.time()
                     if self.layout_try:
                         self.layout_try = False
                         if not items and not all_grey:  # saved layout doesn't fit this window
@@ -1769,7 +1784,10 @@ start "" "{sys.executable}"
                     hidden = len(items) - len(keep)
                     items, rects = [items[i] for i in keep], [rects[i] for i in keep]
                 # a row hidden (mouse cursor, tooltip): re-read as soon as anything moves
+                was = self.incomplete
                 self.incomplete = bool(self.rows) and (hidden > 0 or len(items) + last_faded < len(self.rows))
+                if self.incomplete and not was:
+                    self.incomplete_since = time.time()
                 # the list itself is only touched on the window's thread (no races with it)
                 took = time.time() - t
                 shot = None
