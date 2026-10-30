@@ -31,6 +31,11 @@ jobs:
       - name: Install packages
         run: pip install rapidocr-onnxruntime rapidfuzz mss numpy requests pyinstaller
 
+      - name: Test - read the shops in tests/shots (a broken reader never gets released)
+        run: |
+          python tests/read_test.py
+          python tests/live_test.py
+
       - name: Get prices from the last release
         if: github.event_name == 'push' || inputs.refresh_prices != true
         continue-on-error: true
