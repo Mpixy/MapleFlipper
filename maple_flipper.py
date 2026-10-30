@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.63"
+VERSION = "0.64"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -38,7 +38,7 @@ LEARN_FILE = os.path.join(DATA, "learned.json")
 STATS_FILE = os.path.join(DATA, "flips.json")
 SHOPS_FILE = os.path.join(DATA, "shops.json")  # shops you visited: seller -> when, best profit
 MARKET_FILE = os.path.join(DATA, "market.json")  # player-market prices: item -> [typical low, typical high]
-MARKET_URL = "https://meso.watch/"
+MARKET_URLS = ("https://meso.watch/data/list.json", "https://meso.watch/data/market.json")
 CHEAP = 0.8  # a shop price under 80% of the typical market range = a blue 'cheap' alert
 REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
 RELEASE = "https://github.com/Mpixy/MapleFlipper/releases/download/latest/"
@@ -724,33 +724,22 @@ def tooltip_title(img, badge):
     return re.sub(r"^[^A-Za-z0-9]+", "", read_line(np.ascontiguousarray(clean)) or "").strip()
 
 
-def parse_market(data):
-    """meso.watch style data -> {item: [typical low, typical high]}. Accepts a list of item
-    objects or a {name: object} dict; the range fields are found by their names."""
-    out = {}
-    items = data.items() if isinstance(data, dict) else ((None, d) for d in data or [])
-    for name, d in items:
-        if isinstance(d, (list, tuple)) and len(d) >= 2 and name:
-            lo, hi = d[0], d[1]
-        elif isinstance(d, dict):
-            name = d.get("name") or d.get("item") or d.get("itemName") or name
-            low = [k for k in d if re.search(r"low|min|p25|from", k, re.I)]
-            high = [k for k in d if re.search(r"high|max|p75|to$", k, re.I)]
-            rng = d.get("typicalRange") or d.get("typical_range") or d.get("range")
-            if isinstance(rng, dict):
-                low = [k for k in rng if re.search(r"low|min|from", k, re.I)]
-                high = [k for k in rng if re.search(r"high|max|to", k, re.I)]
-                d = rng
-            elif isinstance(rng, (list, tuple)) and len(rng) >= 2:
-                d, low, high = {"lo": rng[0], "hi": rng[1]}, ["lo"], ["hi"]
-            lo, hi = (d[low[0]] if low else None), (d[high[0]] if high else None)
-        else:
+def parse_market(doc):
+    """meso.watch's market file (data/list.json or data/market.json: {"items": [...]}) ->
+    ({item: [typical low, typical high]}, {cash shop item names}). The typical range is the
+    middle half of the recent sales (p25-p75); an item with under 5 sales: its lowest-highest."""
+    out, cash = {}, set()
+    for it in (doc or {}).get("items") or []:
+        name = it.get("name")
+        if not name:
             continue
-        num = lambda v: int(v) if isinstance(v, (int, float)) else to_int(str(v)) if v else None  # noqa: E731
-        lo, hi = num(lo), num(hi)
-        if name and lo:
-            out[str(name)] = [lo, hi or lo]
-    return out
+        if it.get("cash"):
+            cash.add(name)
+        few = (it.get("priceSales") or it.get("sold") or 0) < 5
+        lo, hi = (it.get("low"), it.get("high")) if few or it.get("p25") is None else (it.get("p25"), it.get("p75"))
+        if lo:
+            out[name] = [int(lo), int(hi or lo)]
+    return out, cash
 
 
 VOLUME = [0.3]  # 0..1, the volume slider
@@ -995,7 +984,13 @@ def pick_region(root, callback):
 
 # ---------------------------------------------------------------- app
 
-HELP_TEXT = """FIND PROFITABLE ITEMS
+HELP_TEXT = """BLUE = CHEAP (meso.watch)
+ A blue row / frame = under 80% of the item's typical player price on meso.watch, with a quiet tik.
+ Prices load by themselves. If meso.watch blocks the app: open meso.watch/data/list.json in your
+ browser, Ctrl+S to save it, then 'Market file' and pick that file.
+ 💎 = NX item (NPCs don't buy it) - learned from the red C coin in the tooltip and from meso.watch.
+
+FIND PROFITABLE ITEMS
 1. Walk into a player shop in the game.
 2. Press F8 (or the big SCAN button).
 3. Green rows = buy it and sell it to any NPC for profit.
@@ -1145,6 +1140,7 @@ class App:
             self.say(f"Fixed {len(self.wild)} wrongly learned prices (back to MeowDB): {', '.join(self.wild[:8])}")
         if not os.path.isdir(os.path.join(HERE, ".git")):  # (a developer's copy updates with git)
             self.root.after(3000, self.check_update)
+        threading.Thread(target=self.update_market, daemon=True).start()
         if self.cfg.get("tracking") and self.cfg.get("meso_area"):
             self.root.after(800, self.toggle_track)  # was tracking last time: keep going
         if not self.cfg.get("seen_help"):
@@ -1207,6 +1203,7 @@ class App:
         vol.bind("<ButtonRelease-1>", lambda e: (self.cfg.__setitem__("volume", self.volume.get()),
                                                  save_json(CONFIG_FILE, self.cfg), soft_ping()))
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
+        ttk.Button(bar, text="Market file", command=self.market_file).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
         ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
         ttk.Button(bar, text="Shops", command=self.shops_window).pack(side="right", padx=(0, 6))
@@ -1527,20 +1524,48 @@ start "" "{sys.executable}"
 
     def update_market(self):
         """Typical player-market ranges from meso.watch -> market.json (kept if the site is down)."""
-        url = self.cfg.get("market_url", MARKET_URL + "api/items")
+        for url in MARKET_URLS:
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=30)
+                r.raise_for_status()
+                if self.use_market(r.json(), "meso.watch"):
+                    dlog("market", url=url, items=len(self.market))
+                    return
+            except Exception as e:
+                dlog("market", url=url, error=str(e))
+        self.say(f"meso.watch didn't let the app download its prices. Using the {len(self.market):,} saved "
+                 "before - or press 'Market file' (Help explains).")
+
+    def use_market(self, doc, where):
+        got, cash = parse_market(doc)
+        if not got:
+            return False
+        self.market = got
+        save_json(MARKET_FILE, got)
+        new_nx = cash - self.learned.nx - set(self.learned.prices)  # an NPC paid for it: not NX after all
+        if new_nx:
+            self.learned.nx |= new_nx
+            self.learned.save()
+        self.names = self.all_names()
+        self.say(f"Market prices updated: {len(got):,} items, {len(cash):,} NX items ({where}).")
+        self.root.after(0, self.rematch)
+        return True
+
+    def market_file(self):
+        """A market file saved from the browser (meso.watch/data/list.json -> Ctrl+S)."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(parent=self.root, title="meso.watch list.json",
+                                          filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
         try:
-            r = requests.get(url, headers=HEADERS, timeout=20)
-            r.raise_for_status()
-            got = parse_market(r.json())
-            if got:
-                self.market = got
-                save_json(MARKET_FILE, got)
-                self.names = self.all_names()
-                self.say(f"Market prices updated: {len(got):,} items (meso.watch).")
-            dlog("market", url=url, items=len(got))
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
         except Exception as e:
-            dlog("market", url=url, error=str(e))
-            self.say(f"Could not read meso.watch ({e}). Using the {len(self.market):,} market prices saved before.")
+            messagebox.showerror("Market file", f"Couldn't read that file: {e}")
+            return
+        if not self.use_market(doc, "file"):
+            messagebox.showerror("Market file", "No item prices in that file - it has to be meso.watch/data/list.json.")
 
     def market_range(self, item):
         return self.learned.market.get(item) or self.market.get(item) if item else None
