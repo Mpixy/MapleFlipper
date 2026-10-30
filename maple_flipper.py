@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.69"
+VERSION = "0.70"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -41,6 +41,7 @@ MARKET_FILE = os.path.join(DATA, "market_seen.json")  # item -> the last 20 pric
 MARKET_KEEP = 20  # prices remembered per item
 MARKET_MIN = 5  # prices needed before the app compares (fewer says too little)
 CHEAP = 0.8  # under 80% of the lowest of those prices = a blue 'cheap' alert
+CHEAP_SAVE = 1000  # ...and at least this much under it (94 instead of 125 is no news)
 REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
 RELEASE = "https://github.com/Mpixy/MapleFlipper/releases/download/latest/"
 FROZEN = getattr(sys, "frozen", False)  # running as MapleFlipper.exe
@@ -1019,7 +1020,8 @@ def pick_region(root, callback):
 HELP_TEXT = """BLUE = CHEAP
  The app remembers the last 20 prices it saw for every item, in every shop you open.
  A blue row / frame + a quiet tik = this shop sells it under 80% of the LOWEST of those 20
- (it starts comparing once it has 5 prices). Then that price joins the 20, so the lowest moves.
+ (it starts comparing once it has 5 prices, and only for 1,000+ mesos under it).
+ Then that price joins the 20, so the lowest moves.
  The 'NPC pays' column shows: low <lowest> (<how many prices>).
  💎 = NX item (NPCs don't buy it) - learned from the red C coin in the tooltip.
 
@@ -1584,9 +1586,10 @@ start "" "{sys.executable}"
             return None  # about what an NPC pays anyway: the seller dumps it at the NPC price, no deal
         if real in self.learned.market and qty:  # a price you typed in
             low = self.learned.market[real][0]
-            return (price / qty, low) if price / qty < CHEAP * low else None
-        got = self.cheap_ref.get((real_key(v), self.seen_shop.get(real_key(v), self.cur_shop)))
-        return got[:2] if got else None
+            got = (price / qty, low) if price / qty < CHEAP * low else None
+        else:
+            got = self.cheap_ref.get((real_key(v), self.seen_shop.get(real_key(v), self.cur_shop)))
+        return got[:2] if got and (got[1] - got[0]) * qty >= CHEAP_SAVE else None
 
     def judge_price(self, key, v):
         """The first time a row is seen: compare it with the prices from before, then add it."""
