@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.80"
+VERSION = "0.81"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -96,6 +96,23 @@ def log_error(etype, value, tb):
 
 sys.excepthook = log_error
 threading.excepthook = lambda a: log_error(a.exc_type, a.exc_value, a.exc_traceback)
+# a hard crash (inside the text reader / the window library) leaves no Python error: this
+# file then says where every thread was. Also written when the app is stuck (App.watchdog).
+import faulthandler  # noqa: E402
+try:
+    _crash_file = open(os.path.join(DATA, "crash_log.txt"), "a", encoding="utf-8")
+    faulthandler.enable(_crash_file, all_threads=True)
+except OSError:
+    _crash_file = None
+
+
+def dump_threads(why):
+    """Write where every thread is right now (for a stuck app) to crash_log.txt."""
+    if _crash_file:
+        _crash_file.write(time.strftime("\n%Y-%m-%d %H:%M:%S ") + why + "\n")
+        _crash_file.flush()
+        faulthandler.dump_traceback(_crash_file, all_threads=True)
+        _crash_file.flush()
 
 
 # ---------------------------------------------------------------- debug log (for Claude, not shown)
@@ -1214,7 +1231,10 @@ class App:
         # the background threads never touch the window themselves (Tk isn't thread-safe: that
         # froze / crashed the app): they queue calls here, and the window's thread runs them
         self.calls = queue.SimpleQueue()
+        self.loop_beat = self.ui_beat = time.time()  # last sign of life of the detection loop / the window
+        self.dumped = set()
         self.root.after(30, self.pump)
+        threading.Thread(target=self.watchdog, daemon=True).start()
         self.learned = Learned()
         self.stats = load_json(STATS_FILE, {"flips": [], "to_sell": []})
         # bought from player shops, waiting to be sold: [item, text read, qty, expected NPC value, paid]
@@ -1308,7 +1328,21 @@ class App:
                 fn(*args)
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
+        self.ui_beat = time.time()
+        if time.time() - self.loop_beat > 3:  # the detection loop stopped: no frames left behind
+            self.hide_marks()
+            self.hide_progress()
         self.root.after(30, self.pump)
+
+    def watchdog(self):
+        """Something stuck for 15 s (the window or the detection loop): write down where."""
+        while True:
+            time.sleep(2)
+            for name, beat in (("window", self.ui_beat), ("detection loop", self.loop_beat)):
+                if time.time() - beat > 15 and (name, int(beat)) not in self.dumped:
+                    self.dumped.add((name, int(beat)))
+                    dlog("stuck", what=name, secs=int(time.time() - beat))
+                    dump_threads(f"STUCK: the {name} did nothing for {int(time.time() - beat)} s")
 
     # ---- UI
     def build_ui(self):
@@ -1530,6 +1564,7 @@ start "" "{sys.executable}"
         m_pending, m_hits = None, 0
         while True:
             time.sleep(0.12)
+            self.loop_beat = time.time()
             if self.busy and time.time() - self.busy_since > 15:
                 self.busy = False  # safety net: a scan never takes this long
             if not self.auto_on or self.busy:
@@ -1581,6 +1616,8 @@ start "" "{sys.executable}"
                     btn = find_shop_button(screen[:, :, ::-1])
                     if not btn:
                         tried = None
+                        if getattr(self, "prog_shown", False):  # no shop on the screen: no sign either
+                            self.post(self.hide_progress)
                         continue
                     if self.redetect:  # the saved layout didn't fit: look at this same shop again
                         self.redetect, tried = False, None
@@ -2284,7 +2321,7 @@ start "" "{sys.executable}"
                 for fn in files:
                     p = os.path.join(folder, fn)
                     z.write(p, os.path.relpath(p, DATA))
-            for fn in ("error_log.txt", "config.json", "learned.json", "flips.json"):
+            for fn in ("error_log.txt", "crash_log.txt", "config.json", "learned.json", "flips.json"):
                 p = os.path.join(DATA, fn)
                 if os.path.exists(p):
                     z.write(p, fn)
@@ -2886,9 +2923,10 @@ start "" "{sys.executable}"
         self.prog_lbl.config(text=text, fg=color)
         self.prog_win.geometry(f"+{bx - 330}+{by - 125}")  # over the seller's character
         self.prog_win.deiconify()
+        self.prog_shown = True
 
     def hide_progress(self):
-        self.shop_low = 0
+        self.shop_low, self.prog_shown = 0, False
         if getattr(self, "prog_win", None):
             self.prog_win.withdraw()
 
