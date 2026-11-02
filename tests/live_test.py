@@ -61,6 +61,7 @@ mf.grab = fake_grab
 mf.App.overlaps_me = lambda self, box: False
 mf.App.update_db = lambda self: None
 mf.App.check_update = lambda self: None
+mf.App.show_help = lambda self: None  # (a help box blocks closing the window at the end)
 app = mf.App()
 app.cfg["seen_help"] = True
 fails = []
