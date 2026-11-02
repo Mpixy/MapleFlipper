@@ -5,6 +5,7 @@ Prices come from MeowDB (meowdb.com/msclassic), cached locally in prices.json.
 Screen reading is done with OCR only; nothing is sent to the game.
 """
 import concurrent.futures as cf
+import queue
 import ctypes
 import html as htmllib
 import json
@@ -26,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.79"
+VERSION = "0.80"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1210,6 +1211,10 @@ class App:
             self.root.geometry(self.cfg["geometry"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.report_callback_exception = lambda *exc: log_error(*exc)
+        # the background threads never touch the window themselves (Tk isn't thread-safe: that
+        # froze / crashed the app): they queue calls here, and the window's thread runs them
+        self.calls = queue.SimpleQueue()
+        self.root.after(30, self.pump)
         self.learned = Learned()
         self.stats = load_json(STATS_FILE, {"flips": [], "to_sell": []})
         # bought from player shops, waiting to be sold: [item, text read, qty, expected NPC value, paid]
@@ -1288,6 +1293,23 @@ class App:
             save_json(CONFIG_FILE, self.cfg)
             self.root.after(500, self.show_help)
 
+    def post(self, fn, *args):
+        """Run fn(*args) on the window's thread, soon (safe to call from any thread)."""
+        self.calls.put((fn, args))
+
+    def pump(self):
+        t = time.time()
+        while time.time() - t < 0.05:
+            try:
+                fn, args = self.calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception as e:
+                log_error(type(e), e, e.__traceback__)
+        self.root.after(30, self.pump)
+
     # ---- UI
     def build_ui(self):
         r = self.root
@@ -1331,6 +1353,8 @@ class App:
         ttk.Checkbutton(bar, text="Marks", variable=self.show_marks,
                         command=lambda: self.show_marks.get() or self.hide_marks()).pack(side="left", padx=(0, 6))
         self.auto = tk.BooleanVar(value=self.cfg.get("auto", True))
+        self.auto_on = self.auto.get()  # (a plain copy the background thread may read)
+        self.auto.trace_add("write", lambda *_: setattr(self, "auto_on", self.auto.get()))
         ttk.Checkbutton(bar, text="Auto", variable=self.auto).pack(side="left", padx=(0, 6))
         self.beep = tk.BooleanVar(value=self.cfg.get("beep", True))
         ttk.Checkbutton(bar, text="Beep", variable=self.beep).pack(side="left")
@@ -1411,7 +1435,7 @@ class App:
                 self.log.delete(0)
             self.log.insert(0, line)
             self.log.delete(200, "end")
-        self.root.after(0, ui)
+        self.post(ui)
 
     def latest_version(self):
         """The newest version you can update to: for the .exe the one already built on GitHub
@@ -1439,10 +1463,10 @@ class App:
             newer = new and tuple(map(int, new.split("."))) > tuple(map(int, VERSION.split(".")))
             dlog("update_check", have=VERSION, latest=new, manual=manual)
             if newer:
-                self.root.after(0, lambda: (self.update_btn.config(text=f"⬆ Update to v{new}"),
+                self.post(lambda: (self.update_btn.config(text=f"⬆ Update to v{new}"),
                                             self.update_btn.pack(side="left", padx=8)))
                 if manual:
-                    self.root.after(0, lambda: messagebox.askyesno(
+                    self.post(lambda: messagebox.askyesno(
                         "MapleFlipper", f"Version {new} is out (you have {VERSION}).\nUpdate now? "
                         "It restarts by itself - nothing you learned is lost.") and self.self_update())
             elif manual:
@@ -1508,7 +1532,7 @@ start "" "{sys.executable}"
             time.sleep(0.12)
             if self.busy and time.time() - self.busy_since > 15:
                 self.busy = False  # safety net: a scan never takes this long
-            if not self.auto.get() or self.busy:
+            if not self.auto_on or self.busy:
                 continue
             try:
                 with mss.mss() as sct:
@@ -1531,7 +1555,7 @@ start "" "{sys.executable}"
                         if rows and sb:  # empty slots under the last row: the list ends on this page
                             self.page_end = last_empty > 0 or empty_below(
                                 screen, rows, sb["left"] - mon["left"], sb["top"] - mon["top"])
-                        self.root.after(0, self.show_progress, int(btn[0]) + mon["left"], int(btn[1]) + mon["top"], sp)
+                        self.post(self.show_progress, int(btn[0]) + mon["left"], int(btn[1]) + mon["top"], sp)
                     if v is not None:  # your mesos in the shop window: 2 equal reads in a row
                         self.shop_mesos_t = time.time()
                         m_hits = m_hits + 1 if v == m_pending else 1
@@ -1539,16 +1563,16 @@ start "" "{sys.executable}"
                         old = self.mesos
                         glitch = old is not None and (lost_digits(str(v), str(old)) or lost_digits(str(old), str(v)))
                         if m_hits == (4 if glitch else 2) and v != old:
-                            self.root.after(0, self.on_mesos, v)
+                            self.post(self.on_mesos, v)
                     moved = btn and self.shop_btn and (abs(btn[0] - self.shop_btn[0]) > 40
                                                        or abs(btn[1] - self.shop_btn[1]) > 40)
                     misses = misses + 1 if (not btn or moved) else 0
                     if misses >= 2:  # mouse hover can hide the button for a moment
                         misses = 0
                         self.shop_box, last, tried = None, None, None
-                        self.root.after(0, self.hide_marks)
-                        self.root.after(0, self.hide_progress)
-                        self.root.after(0, self.left_shop)
+                        self.post(self.hide_marks)
+                        self.post(self.hide_progress)
+                        self.post(self.left_shop)
                         self.say("Shop closed - waiting for the next shop.")
                         continue
                 if not box:  # no shop known: look for one (cheap colour check, no OCR)
@@ -1577,7 +1601,7 @@ start "" "{sys.executable}"
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     self.shop_btn_abs = (x, y)
                     if not same_shop:
-                        self.root.after(0, self.new_shop, sig)
+                        self.post(self.new_shop, sig)
                     self.say(f"Shop of {sig or '?'} - reading it...")
                     lay = self.cfg.get("layout2")
                     if lay:  # every shop window looks the same: read the rows right away
@@ -1585,12 +1609,12 @@ start "" "{sys.executable}"
                                          "width": lay["w"], "height": lay["h"]}
                         self.rows = [[tuple(a[:3]) + (None,) for a in row] for row in lay["rows"]]
                         self.scanned, self.layout_try = None, True
-                        self.root.after(0, self.scan, True, self.shop_box)
+                        self.post(self.scan, True, self.shop_box)
                     else:
                         # just the item list (left half, under the buttons): less to read = faster
                         cand = {"left": max(x - 420, mon["left"]), "top": max(y + 80, mon["top"]),
                                 "width": 580, "height": 520}
-                        self.root.after(0, self.scan, True, cand)
+                        self.post(self.scan, True, cand)
                     last = None
                     continue
                 if self.redetect:  # the saved layout didn't fit: find the shop the slow way
@@ -1613,9 +1637,9 @@ start "" "{sys.executable}"
                         or (now and self.shop_sig and not same_seller(now, self.shop_sig))):
                     # another shop: forget this one so it is detected (and cleared) as new
                     self.shop_box, self.shop_btn, self.shop_sig, last, tried = None, None, None, None, None
-                    self.root.after(0, self.hide_marks)
+                    self.post(self.hide_marks)
                     continue
-                self.root.after(0, self.scan, True)
+                self.post(self.scan, True)
             last = img
 
     def start_hotkey(self):
@@ -1626,20 +1650,20 @@ start "" "{sys.executable}"
             while True:
                 down = bool(user32.GetAsyncKeyState(0x77) & 0x8000)  # VK_F8
                 if down and not was_down:
-                    self.root.after(0, self.scan)
+                    self.post(self.scan)
                 was_down = down
                 d9 = bool(user32.GetAsyncKeyState(0x78) & 0x8000)  # VK_F9: mini / full window
                 if d9 and not was9:
-                    self.root.after(0, self.toggle_mini)
+                    self.post(self.toggle_mini)
                 was9 = d9
                 d10 = bool(user32.GetAsyncKeyState(0x79) & 0x8000)  # VK_F10: clear the list
                 if d10 and not was10:
-                    self.root.after(0, self.clear)
+                    self.post(self.clear)
                     self.say("List cleared (F10).")
                 was10 = d10
                 d11 = bool(user32.GetAsyncKeyState(0x7A) & 0x8000)  # VK_F11: "this is wrong!"
                 if d11 and not was11:
-                    self.root.after(0, self.complain)
+                    self.post(self.complain)
                 was11 = d11
                 time.sleep(0.03)
         threading.Thread(target=loop, daemon=True).start()
@@ -1752,7 +1776,7 @@ start "" "{sys.executable}"
         if item and item not in self.learned.prices and self.learned.mark_nx(item):
             self.names = self.all_names()
             self.say(f"Learned: '{item}' is an NX (cash) item - NPCs don't buy it.")
-            self.root.after(0, self.rematch)
+            self.post(self.rematch)
 
     def check_tooltip(self, screen, mon):
         """The mouse rests on a shop row and the game shows its tooltip: the tooltip's title is
@@ -1781,7 +1805,7 @@ start "" "{sys.executable}"
             return  # the tooltip of another row (the mouse moved on): don't trust it
         self.learned.alias(row, real)
         self.say(f"Learned from the tooltip: '{row}' is '{real}'.")
-        self.root.after(0, self.rematch)
+        self.post(self.rematch)
 
     def check_selected(self, screen, mon):
         """The row you clicked turns orange (and stays so while 'Are you sure you want to buy
@@ -1896,7 +1920,7 @@ start "" "{sys.executable}"
                     if not items:
                         npc = find_npc_items(lines)
                         if npc:
-                            self.root.after(0, self.learn_npc, npc)
+                            self.post(self.learn_npc, npc)
                 prices_l = [o for o in lines if PRICE_LINE.search(o["text"])]
                 if items and prices_l and not (box and box is self.shop_box):  # remember where the shop is so next scans are fast
                     x0 = min(o["x"] for o in prices_l) + img_origin["left"]
@@ -1961,7 +1985,7 @@ start "" "{sys.executable}"
                 dlog("scan", auto=auto, shop=self.cur_shop, ms=int(took * 1000), items=len(items),
                      fast=bool(box and box is self.shop_box and not lines), layout=bool(self.cfg.get("layout2")),
                      shot=shot)
-                self.root.after(0, self.apply_scan, items, rects, mark_box, auto, took)
+                self.post(self.apply_scan, items, rects, mark_box, auto, took)
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
                 self.say(f"Scan failed: {e}")
@@ -2476,7 +2500,7 @@ start "" "{sys.executable}"
             # bought for yourself (no profit selling it to an NPC): not a flip, don't track it
             dlog("bought_not_flip", item=real, paid=spent, profit=p)
             self.seen.pop(key, None)
-            self.root.after(0, self.refresh)
+            self.post(self.refresh)
             return
         if price != spent:  # show what you really paid
             self.seen.pop(key, None)
@@ -2496,8 +2520,8 @@ start "" "{sys.executable}"
         pays = self.npc_pays(real, qty)
         self.bought.append([real, raw, qty, pays, spent])
         self.save_stats()
-        self.root.after(0, self.refresh)
-        self.root.after(0, self.show_banner)
+        self.post(self.refresh)
+        self.post(self.show_banner)
         res = "" if pays is None else f" NPC pays {pays:,} -> {pays - spent:+,}."
         fix = (f" ({qty} × {price:,})" if qty > 1 and spent == price * qty
                else f" (the shop read {price:,} - fixed)" if price != spent else "")
@@ -2580,7 +2604,7 @@ start "" "{sys.executable}"
 
     def save_stats(self):
         save_json(STATS_FILE, self.stats)
-        self.root.after(0, self.show_stats)
+        self.post(self.show_stats)
 
     def record_flip(self, item, paid, got):
         seller = self.stats.setdefault("from", {}).pop(item, "")
@@ -3080,7 +3104,7 @@ start "" "{sys.executable}"
                 old = self.mesos
                 glitch = old is not None and (lost_digits(str(v), str(old)) or lost_digits(str(old), str(v)))
                 if hits == (6 if glitch else 2) and v != old:
-                    self.root.after(0, self.on_mesos, v)
+                    self.post(self.on_mesos, v)
 
     def on_mesos(self, v):
         old = self.mesos

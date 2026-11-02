@@ -52,6 +52,9 @@ def load(name):
     return np.array(Image.open(os.path.join(HERE, name)).convert("RGB"))[:, :, ::-1].copy()
 
 
+os.makedirs(os.path.join(os.environ["LOCALAPPDATA"], "MapleFlipper"), exist_ok=True)
+with open(os.path.join(os.environ["LOCALAPPDATA"], "MapleFlipper", "config.json"), "w") as f:
+    f.write('{"seen_help": true}')  # (no help box: it blocks closing the window at the end)
 current["img"] = load(order[0])
 mf.mss.mss = FakeMss
 mf.grab = fake_grab
