@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.85"
+VERSION = "0.86"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1350,10 +1350,6 @@ class App:
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
         self.ui_beat = time.time()
-        if time.time() - getattr(self, "rect_t", 0) > 1:  # where this window is (for the detection thread)
-            self.rect_t = time.time()
-            w = self.visible_win()
-            self.win_rect = (w.winfo_rootx(), w.winfo_rooty(), w.winfo_width(), w.winfo_height())
         if time.time() - self.loop_beat > 3:  # the detection loop stopped: no frames left behind
             self.hide_marks()
             self.hide_progress()
@@ -1643,14 +1639,7 @@ start "" "{sys.executable}"
                         tried = None
                         if getattr(self, "prog_shown", False):  # no shop on the screen: no sign either
                             self.post(self.hide_progress)
-                        if time.time() - getattr(self, "map_t", 0) > 4:
-                            self.map_t = time.time()
-                            self.mark_visited(screen, mon)
-                        else:
-                            self.track_visited(screen, mon)
                         continue
-                    if getattr(self, "vmarks", None):  # a shop is open: no marks on the map
-                        self.clear_visited()
                     if self.redetect:  # the saved layout didn't fit: look at this same shop again
                         self.redetect, tried = False, None
                     tried = tried or []
@@ -1670,10 +1659,6 @@ start "" "{sys.executable}"
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     self.shop_btn_abs = (x, y)
                     if not same_shop:
-                        try:
-                            self.next_title = shop_title(screen, btn)
-                        except Exception:
-                            self.next_title = ""
                         self.post(self.new_shop, sig)
                     self.say(f"Shop of {sig or '?'} - reading it...")
                     lay = self.cfg.get("layout2")
@@ -3053,117 +3038,7 @@ start "" "{sys.executable}"
         self.shops_lbl.config(text=f"Shops checked this session: {self.shops_today}    "
                                    f"Profit spotted: +{self.found_today:,}")
         if not self.revisit:
-            self.save_shop()  # visited as of now (the map shows it ✔ even if you leave at once)
-
-    def mark_visited(self, screen, mon):
-        """On the map: find the signs / name tags of shops you already visited (in the last 12
-        hours). Reads the screen every 4 s; in between track_visited follows each one by its
-        picture, so the marks move with the map instead of jumping / blinking."""
-        recent = [(n, r) for n, r in list(self.shops.items()) if time.time() - r.get("t", 0) < 12 * 3600]
-        if not recent:
-            return
-        names = {}
-        for n, r in recent:
-            for key in (norm(n), norm(r.get("title", ""))):
-                if len(key) >= 4:
-                    names[key] = (n, r)
-        wx, wy, ww, wh = getattr(self, "win_rect", (0, 0, 0, 0))
-        marks = self.__dict__.setdefault("vmarks", [])
-        for o in ocr(screen):
-            t = norm(o["text"])
-            ax, ay = o["x"] + mon["left"], o["y"] + mon["top"]
-            if len(t) < 4 or (wx <= ax <= wx + ww and wy <= ay <= wy + wh):  # (not this app's own window)
-                continue
-            hit = names.get(t) or next((v for k, v in names.items() if len(t) >= 6 and k.startswith(t)
-                                        or len(k) >= 6 and t.startswith(k)), None)
-            if not hit:
-                continue
-            x0, x1 = int(o["x"]) - 4, int(o["x2"]) + 4
-            y0, y1 = int(o["y"] - o["h"] / 2) - 4, int(o["y"] + o["h"] / 2) + 4
-            patch = screen[max(y0, 0):y1, max(x0, 0):x1]
-            if patch.shape[0] < 8 or patch.shape[1] < 20:
-                continue
-            old = next((m for m in marks if abs(m["x"] - x0) < 40 and abs(m["y"] - y0) < 25), None)
-            if old:
-                old.update(patch=np.ascontiguousarray(patch), x=x0, y=y0, miss=0)
-            else:
-                marks.append({"patch": np.ascontiguousarray(patch), "x": x0, "y": y0, "w": x1 - x0,
-                              "h": y1 - y0, "t": hit[1]["t"], "miss": 0})
-        self.show_visited(mon)
-
-    def track_visited(self, screen, mon):
-        """Every 0.25 s: find each marked sign again near where it was (the map scrolls)."""
-        import cv2
-        marks = getattr(self, "vmarks", [])
-        if not marks:
-            return
-        for m in marks:
-            p, r = m["patch"], 160
-            x0, y0 = max(m["x"] - r, 0), max(m["y"] - r, 0)
-            area = screen[y0:m["y"] + m["h"] + r, x0:m["x"] + m["w"] + r]
-            if area.shape[0] < p.shape[0] or area.shape[1] < p.shape[1]:
-                m["miss"] += 1
-                continue
-            res = cv2.matchTemplate(area, p, cv2.TM_CCOEFF_NORMED)
-            _, best, _, at = cv2.minMaxLoc(res)
-            if best > 0.75:
-                m["x"], m["y"], m["miss"] = x0 + at[0], y0 + at[1], 0
-            else:
-                m["miss"] += 1  # out of view / covered: kept a moment, then dropped
-        marks[:] = [m for m in marks if m["miss"] < 12]
-        self.show_visited(mon)
-
-    def show_visited(self, mon):
-        now = [(m["x"] + mon["left"], m["y"] + mon["top"], m["w"], m["h"], m["t"])
-               for m in getattr(self, "vmarks", []) if m["miss"] < 3]
-        if now != getattr(self, "vshown", None):  # only redraw when something moved (no blinking)
-            self.vshown = now
-            self.post(self.draw_visited, now)
-
-    def clear_visited(self):
-        self.vmarks, self.vshown = [], None
-        self.post(self.draw_visited, [])
-
-    def draw_visited(self, marks):
-        """A thick green frame around each visited shop's sign / name + 'VISITED · 10 min ago'."""
-        self.visited_shown = bool(marks)
-        if not marks or not self.show_marks.get():
-            if getattr(self, "visit_win", None):
-                self.visit_win.withdraw()
-            return
-        if not getattr(self, "visit_win", None):
-            w = tk.Toplevel(self.root)
-            w.overrideredirect(True)
-            w.attributes("-topmost", True)
-            w.configure(bg="#ff00ff")
-            try:
-                w.attributes("-transparentcolor", "#ff00ff")
-            except tk.TclError:
-                w.attributes("-alpha", 0.7)
-            self.visit_canvas = tk.Canvas(w, bg="#ff00ff", highlightthickness=0)
-            self.visit_canvas.pack(fill="both", expand=True)
-            w.update_idletasks()
-            try:  # clicks go through to the game
-                hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
-                style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-                ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
-            except Exception:
-                pass
-            with mss.mss() as sct:
-                self.visit_mon = sct.monitors[0]
-            m = self.visit_mon
-            w.geometry(f"{m['width']}x{m['height']}+{m['left']}+{m['top']}")
-            self.visit_win = w
-        m = self.visit_mon
-        c = self.visit_canvas
-        c.delete("all")
-        for x, y, w, h, t in marks:
-            x, y = x - m["left"], y - m["top"]
-            c.create_rectangle(x - 6, y - 4, x + w + 6, y + h + 4, outline="#18c43a", width=5)
-            label = f"✔ VISITED · {ago(t)}"
-            c.create_rectangle(x - 6, y - 30, x - 6 + 9 * len(label) + 14, y - 6, fill="#18c43a", outline="#0b7a22")
-            c.create_text(x + 2, y - 18, anchor="w", text=label, fill="#ffffff", font=("Segoe UI", 11, "bold"))
-        self.visit_win.deiconify()
+            self.save_shop()  # visited as of now (the Shops list has it even if you leave at once)
 
     def known_shop(self, seller):
         if not seller:
