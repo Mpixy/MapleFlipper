@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.83"
+VERSION = "0.84"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -928,6 +928,18 @@ def soft_ping():
     play([1320], 60)
 
 
+def shop_title(img, btn):
+    """The shop's name at the top of the shop window ('scrolls and equips <3') - the same
+    text as the sign over the shop on the map."""
+    x, y = int(btn[0]), int(btn[1])
+    x0, y0 = max(x - 340, 0), max(y - 165, 0)
+    crop = img[y0:max(y - 95, 0), x0:x + 60]
+    if crop.shape[0] < 15 or crop.shape[1] < 100:
+        return ""
+    lines = [o for o in ocr(np.ascontiguousarray(crop)) if len(norm(o["text"])) >= 2]
+    return min(lines, key=lambda o: o["y"])["text"].strip() if lines else ""
+
+
 def ago(t):
     m = int((time.time() - t) // 60)
     return "just now" if m < 1 else f"{m} min ago" if m < 60 else f"{m // 60}h {m % 60:02d}m ago"
@@ -1338,6 +1350,10 @@ class App:
             except Exception as e:
                 log_error(type(e), e, e.__traceback__)
         self.ui_beat = time.time()
+        if time.time() - getattr(self, "rect_t", 0) > 1:  # where this window is (for the detection thread)
+            self.rect_t = time.time()
+            w = self.visible_win()
+            self.win_rect = (w.winfo_rootx(), w.winfo_rooty(), w.winfo_width(), w.winfo_height())
         if time.time() - self.loop_beat > 3:  # the detection loop stopped: no frames left behind
             self.hide_marks()
             self.hide_progress()
@@ -1627,7 +1643,12 @@ start "" "{sys.executable}"
                         tried = None
                         if getattr(self, "prog_shown", False):  # no shop on the screen: no sign either
                             self.post(self.hide_progress)
+                        if time.time() - getattr(self, "map_t", 0) > 4:
+                            self.map_t = time.time()
+                            self.mark_visited(screen, mon)
                         continue
+                    if getattr(self, "visited_shown", False):
+                        self.post(self.draw_visited, [])
                     if self.redetect:  # the saved layout didn't fit: look at this same shop again
                         self.redetect, tried = False, None
                     tried = tried or []
@@ -1647,6 +1668,10 @@ start "" "{sys.executable}"
                     x, y = int(btn[0]) + mon["left"], int(btn[1]) + mon["top"]
                     self.shop_btn_abs = (x, y)
                     if not same_shop:
+                        try:
+                            self.next_title = shop_title(screen, btn)
+                        except Exception:
+                            self.next_title = ""
                         self.post(self.new_shop, sig)
                     self.say(f"Shop of {sig or '?'} - reading it...")
                     lay = self.cfg.get("layout2")
@@ -2930,7 +2955,7 @@ start "" "{sys.executable}"
                 pass
             self.prog_win = w
         self.prog_lbl.config(text=text, fg=color)
-        self.prog_win.geometry(f"+{bx - 330}+{by - 125}")  # over the seller's character
+        self.prog_win.geometry(f"+{bx + 90}+{by - 150}")  # right part of the shop's title bar
         self.prog_win.deiconify()
         self.prog_shown = True
 
@@ -3004,6 +3029,7 @@ start "" "{sys.executable}"
                 self.unsure.discard(key)
         self.save_shop()  # the shop you just left
         self.cur_shop = seller
+        self.cur_title = getattr(self, "next_title", "")
         self.on_page, self.page_order = set(), []
         self.shops_today += 1
         name = self.known_shop(seller)
@@ -3012,6 +3038,7 @@ start "" "{sys.executable}"
         if rec and time.time() - rec["t"] < 12 * 3600:
             self.revisit = (rec["t"], rec["best"])
             self.cur_shop = name  # same spelling as last time
+            self.cur_title = self.cur_title or rec.get("title", "")
             best = f"best was +{rec['best']:,}" if rec["best"] > 0 else "nothing worth buying"
             self.say(f"↺ {name}: you checked this shop {ago(rec['t'])} - {best}.")
         self.refresh()
@@ -3023,6 +3050,75 @@ start "" "{sys.executable}"
             self.set_banner(f"🔍 Reading {seller or 'the shop'}...", "#e8e8e8", "#555")
         self.shops_lbl.config(text=f"Shops checked this session: {self.shops_today}    "
                                    f"Profit spotted: +{self.found_today:,}")
+        if not self.revisit:
+            self.save_shop()  # visited as of now (the map shows it ✔ even if you leave at once)
+
+    def mark_visited(self, screen, mon):
+        """On the map: find the signs / name tags of shops you already visited (in the last 12
+        hours) and put a ✔ on them. (Detection thread; reads the screen every 4 s.)"""
+        recent = [(n, r) for n, r in list(self.shops.items()) if time.time() - r.get("t", 0) < 12 * 3600]
+        if not recent:
+            return
+        names = {}
+        for n, r in recent:
+            for key in (norm(n), norm(r.get("title", ""))):
+                if len(key) >= 4:
+                    names[key] = (n, r)
+        marks = []
+        wx, wy, ww, wh = getattr(self, "win_rect", (0, 0, 0, 0))
+        for o in ocr(screen):
+            t = norm(o["text"])
+            ax, ay = o["x"] + mon["left"], o["y"] + mon["top"]
+            if len(t) < 4 or (wx <= ax <= wx + ww and wy <= ay <= wy + wh):  # (not this app's own window)
+                continue
+            hit = names.get(t) or next((v for k, v in names.items() if len(t) >= 6 and k.startswith(t)
+                                        or len(k) >= 6 and t.startswith(k)), None)
+            if hit:
+                marks.append((o["x"] + mon["left"], o["y"] + mon["top"], o["x2"] + mon["left"], hit[1]["t"]))
+        self.post(self.draw_visited, marks)
+
+    def draw_visited(self, marks):
+        """✔ + how long ago, on the map next to each visited shop's sign / name."""
+        self.visited_shown = bool(marks)
+        if not marks or not self.show_marks.get():
+            if getattr(self, "visit_win", None):
+                self.visit_win.withdraw()
+            return
+        if not getattr(self, "visit_win", None):
+            w = tk.Toplevel(self.root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            w.configure(bg="#ff00ff")
+            try:
+                w.attributes("-transparentcolor", "#ff00ff")
+            except tk.TclError:
+                w.attributes("-alpha", 0.7)
+            self.visit_canvas = tk.Canvas(w, bg="#ff00ff", highlightthickness=0)
+            self.visit_canvas.pack(fill="both", expand=True)
+            w.update_idletasks()
+            try:  # clicks go through to the game
+                hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+                ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
+            except Exception:
+                pass
+            self.visit_win = w
+        with mss.mss() as sct:
+            m = sct.monitors[0]
+        self.visit_win.geometry(f"{m['width']}x{m['height']}+{m['left']}+{m['top']}")
+        c = self.visit_canvas
+        c.delete("all")
+        done = []
+        for x, y, x2, t in marks:
+            if any(abs(x - a) < 60 and abs(y - b) < 30 for a, b in done):
+                continue  # (sign and name of the same shop: one mark)
+            done.append((x, y))
+            x, y = x - m["left"], y - m["top"]
+            c.create_oval(x - 30, y - 12, x - 6, y + 12, fill="#20b030", outline="#ffffff", width=2)
+            c.create_text(x - 18, y, text="✔", fill="#ffffff", font=("Segoe UI", 11, "bold"))
+            c.create_text(x2 - m["left"] + 8, y, anchor="w", text=ago(t), fill="#20b030",
+                          font=("Segoe UI", 10, "bold"))
+        self.visit_win.deiconify()
 
     def known_shop(self, seller):
         if not seller:
@@ -3037,7 +3133,8 @@ start "" "{sys.executable}"
             return
         best = max([p for k, v in self.seen.items() if self.seen_shop.get(k) == self.cur_shop
                     and k not in self.unsure and (p := self.profit(v)) is not None and p > 0] or [0])
-        self.shops[self.cur_shop] = {"t": time.time(), "best": best}
+        self.shops[self.cur_shop] = {"t": time.time(), "best": best,
+                                     "title": getattr(self, "cur_title", "") or self.shops.get(self.cur_shop, {}).get("title", "")}
         if len(self.shops) > 500:  # keep the newest
             self.shops = dict(sorted(self.shops.items(), key=lambda kv: -kv[1]["t"])[:400])
         save_json(SHOPS_FILE, self.shops)

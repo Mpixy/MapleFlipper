@@ -108,6 +108,15 @@ def script():
     app.root.after(0, app.root.destroy)
 
 
+def deadline():  # a hang must fail the test, with where every thread was
+    time.sleep(420)
+    import faulthandler
+    print("FAIL: still running after 7 minutes - stuck", flush=True)
+    faulthandler.dump_traceback(all_threads=True)
+    os._exit(1)
+
+
+threading.Thread(target=deadline, daemon=True).start()
 threading.Thread(target=script, daemon=True).start()
 app.run()
 print("PASSED" if not fails else f"FAILED: {fails}")

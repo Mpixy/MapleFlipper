@@ -35,7 +35,7 @@ jobs:
         run: |
           python tests/logic_test.py
           python tests/read_test.py
-          python tests/live_test.py
+          python -u tests/live_test.py
 
       - name: Get prices from the last release
         if: github.event_name == 'push' || inputs.refresh_prices != true
