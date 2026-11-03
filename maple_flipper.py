@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.81"
+VERSION = "0.83"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1022,22 +1022,31 @@ def find_npc_items(lines):
     return items
 
 
-def sale_combos(expects, total, most=6):
+def sale_combos(expects, total, most=6, budget=200_000):
     """Sets of items (indexes) whose expected NPC prices add up to `total` - selling several
-    things before the mesos are read again shows up as one big gain."""
+    things before the mesos are read again shows up as one big gain.
+    Runs on the window's thread: it once froze the app for minutes with a long 'to sell' list
+    (millions of combinations), so the same price is tried once per step, branches that can't
+    reach the total are cut, and the search stops after `budget` steps whatever it found."""
     order = sorted((i for i, e in enumerate(expects) if e), key=lambda i: -expects[i])
-    found = []
+    vals = [expects[i] for i in order]
+    found, steps = [], [0]
 
     def walk(start, left, picked):
+        steps[0] += 1
         if left == 0 and picked:
             found.append(tuple(sorted(picked)))
             return
-        if len(picked) == most or len(found) > 40:
+        if len(picked) == most or len(found) > 40 or steps[0] > budget:
             return
+        room = most - len(picked)
         for k in range(start, len(order)):
-            i = order[k]
-            if expects[i] <= left:
-                walk(k + 1, left - expects[i], picked + [i])
+            v = vals[k]
+            if v > left or (k > start and v == vals[k - 1]):  # (an equal price: same sums again)
+                continue
+            if sum(vals[k:k + room]) < left:  # even the biggest ones left can't add up to it
+                break
+            walk(k + 1, left - v, picked + [order[k]])
     walk(0, total, [])
     return found
 

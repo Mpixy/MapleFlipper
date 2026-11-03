@@ -33,6 +33,7 @@ jobs:
 
       - name: Test - read the shops in tests/shots (a broken reader never gets released)
         run: |
+          python tests/logic_test.py
           python tests/read_test.py
           python tests/live_test.py
 
