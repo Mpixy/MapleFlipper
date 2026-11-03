@@ -68,7 +68,7 @@ fails = []
 
 
 def on_page():
-    return [(app.seen[k][1], app.seen[k][3]) for k in app.page_order if k in app.seen]
+    return [(app.seen[k][1], app.seen[k][3]) for k in list(getattr(app, "page_order", [])) if k in app.seen]
 
 
 def script():
