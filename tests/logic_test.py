@@ -37,5 +37,11 @@ for total in (123457, 999999, sum(prices[:6]), 17):
     t = time.time()
     mf.sale_combos(prices, total)
     check(f"150 items, total {total}: under 0.5 s ({time.time() - t:.3f} s)", time.time() - t < 0.5)
+# 'to sell': bought over a day ago = off the list; older entries without a time get one
+app = types.SimpleNamespace(save_stats=lambda: None)
+app.bought = [["Old", "Old", 1, 50, 40, time.time() - 2 * 86400], ["New", "New", 1, 50, 40, time.time() - 60],
+              ["NoTime", "NoTime", 1, 50, 40]]
+mf.App.expire_bought(app)
+check("to sell: only items bought in the last day stay", [b[0] for b in app.bought] == ["New", "NoTime"])
 print("all good" if not fails else f"{len(fails)} failed")
 sys.exit(1 if fails else 0)

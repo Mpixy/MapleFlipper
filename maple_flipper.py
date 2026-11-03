@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.86"
+VERSION = "0.87"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1262,6 +1262,7 @@ class App:
         self.bought = self.stats["to_sell"]
         # things bought for yourself (a loss at the NPC) were never flips: drop them
         self.bought[:] = [b for b in self.bought if b[3] is None or b[3] - b[4] > 0]
+        self.expire_bought()
         self.shop_box = None
         self.scanned = None
         self.rows = []
@@ -1941,7 +1942,11 @@ start "" "{sys.executable}"
                     stuck = self.incomplete and time.time() - self.incomplete_since > 2.5
                     if (self.layout_try or stuck) and (items or all_grey):
                         # check the fast read once against a full read: a saved layout that is a
-                        # bit off reads 1 row of 4 and keeps doing so (Opal Ore never showed up)
+                        # bit off reads 1 row of 4 and keeps doing so (Opal Ore never showed up).
+                        # Show what the fast read found first - the check costs ~1 s.
+                        if items:
+                            self.post(self.apply_scan, [(it[0], it[1], it[2], it[-1]) for it in items],
+                                      [it[3] for it in items], box, auto, time.time() - t)
                         lines = ocr(img)
                         fresh = find_shop_items(lines)
                         if len(fresh) > len(items) + last_faded:
@@ -2576,7 +2581,8 @@ start "" "{sys.executable}"
         if self.seen_shop.get(key):
             self.stats.setdefault("from", {})[real] = self.seen_shop[key]
         pays = self.npc_pays(real, qty)
-        self.bought.append([real, raw, qty, pays, spent])
+        self.bought.append([real, raw, qty, pays, spent, time.time()])
+        self.expire_bought()
         self.save_stats()
         self.post(self.refresh)
         self.post(self.show_banner)
@@ -2584,6 +2590,19 @@ start "" "{sys.executable}"
         fix = (f" ({qty} × {price:,})" if qty > 1 and spent == price * qty
                else f" (the shop read {price:,} - fixed)" if price != spent else "")
         self.say(f"✔ BOUGHT '{real}' for {spent:,}{fix}.{res} Now sell it to an NPC.")
+
+    def expire_bought(self):
+        """Bought more than a day ago and never seen sold: sold long ago (or kept) - off the
+        list. A long stale list made every mesos gain slow and matched sales to wrong items."""
+        now = time.time()
+        for b in self.bought:
+            if len(b) < 6:
+                b.append(now)  # (bought before this was kept: a day from now)
+        old = [b[0] for b in self.bought if now - b[5] > 24 * 3600]
+        if old:
+            self.bought[:] = [b for b in self.bought if now - b[5] <= 24 * 3600]
+            dlog("expired_to_sell", items=old)
+            self.save_stats()
 
     def learn_from_mesos(self, diff):
         """Buying from a shop and selling to an NPC show up as mesos changes: use them to check
@@ -2633,7 +2652,7 @@ start "" "{sys.executable}"
             return
         if not self.bought:
             return
-        for i, (item, _, qty, expect, paid) in enumerate(self.bought):
+        for i, (item, _, qty, expect, paid, *_) in enumerate(self.bought):
             if expect == diff:
                 self.bought.pop(i)
                 if item not in self.learned.prices:
@@ -2744,7 +2763,7 @@ start "" "{sys.executable}"
                 continue  # a stack (the count on the icon wasn't readable): price matches
             unit = price if (qty <= 1 or npc_value(real, 1, qty) == 1) else round(price / qty)
             # something bought from a player shop under a shorter / wrong name?
-            for i, (b_real, b_raw, b_qty, expect, paid) in enumerate(self.bought):
+            for i, (b_real, b_raw, b_qty, expect, paid, *_) in enumerate(self.bought):
                 if b_real != real and norm(real).startswith(norm(b_raw.rstrip(".… "))):
                     self.bought.pop(i)
                     self.save_stats()
@@ -2771,7 +2790,7 @@ start "" "{sys.executable}"
             self.rematch()
 
     def apply_sale(self, i, got):
-        item, _, qty, expect, paid = self.bought.pop(i)
+        item, _, qty, expect, paid, *_ = self.bought.pop(i)
         if not self.plausible(item, qty, got):  # don't learn nonsense: just count the flip
             self.record_flip(item, paid, expect if expect is not None else got)
             self.sold(item)
@@ -2791,7 +2810,7 @@ start "" "{sys.executable}"
         """Several items sold together at their expected prices."""
         done = []
         for i in sorted(idxs, reverse=True):
-            item, _, qty, expect, paid = self.bought.pop(i)
+            item, _, qty, expect, paid, *_ = self.bought.pop(i)
             self.record_flip(item, paid, expect if expect is not None else paid)
             self.sold(item)
             done.append(item)
@@ -2832,7 +2851,7 @@ start "" "{sys.executable}"
             ok = got and t == got
             total.config(text=f"Ticked: {t:,}" + (f"  /  got {got:,}" if got else "") + ("  ✓" if ok else ""),
                          foreground="#1a8f3a" if ok else "#555")
-        for i, (item, _, qty, expect, paid) in enumerate(self.bought):
+        for i, (item, _, qty, expect, paid, *_) in enumerate(self.bought):
             v = tk.BooleanVar(value=i in preset)
             marks.append(v)
             gain = "" if expect is None else f"   {expect:,}  ({expect - paid:+,})"
