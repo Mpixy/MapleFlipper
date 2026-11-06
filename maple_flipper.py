@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.89"
+VERSION = "0.90"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -40,6 +40,7 @@ STATS_FILE = os.path.join(DATA, "flips.json")
 SHOPS_FILE = os.path.join(DATA, "shops.json")  # shops you visited: seller -> when, best profit
 MARKET_FILE = os.path.join(DATA, "market_seen.json")  # item -> the last 20 prices seen in shops [unit, shop, when]
 MARKET_KEEP = 20  # prices remembered per item
+WEB_FILE = os.path.join(DATA, "web_prices.json")  # read off meso.watch while you browse it: item -> {low, typical, t}
 MARKET_MIN = 5  # prices needed before the app compares (fewer says too little)
 CHEAP = 0.8  # under 80% of the lowest of those prices = a blue 'cheap' alert
 CHEAP_NX = 0.75  # NX items and scrolls: under 75%
@@ -941,6 +942,58 @@ def shop_title(img, btn):
     return min(lines, key=lambda o: o["y"])["text"].strip() if lines else ""
 
 
+WEB_NUM = re.compile(r"^\D{0,2}(\d[\d,.]*)\s*([KkMm]?)$")
+
+
+def web_num(text):
+    """'3,050' / '39.5K' / '6.97M' -> 3050 / 39500 / 6970000 (None: not a price)"""
+    m = WEB_NUM.match(text.strip())
+    if not m:
+        return None
+    num, unit = m.group(1).rstrip(".,"), m.group(2).upper()
+    try:
+        if unit:
+            return int(round(float(num.replace(",", "")) * (1000 if unit == "K" else 1_000_000)))
+        return int(num.replace(",", "").replace(".", ""))
+    except ValueError:
+        return None
+
+
+def web_page_likely(img):
+    """meso.watch's orange tabs are on the screen (cheap check before reading the page)."""
+    a = img[::4, ::4].astype(np.int16)
+    b, g, r = a[..., 0], a[..., 1], a[..., 2]
+    return ((abs(r - 252) < 12) & (abs(g - 168) < 18) & (abs(b - 69) < 20)).mean() > 0.004
+
+
+def read_web_prices(lines):
+    """Prices on a meso.watch page as the screen shows it: the list (ITEM ... TYPICAL) and the
+    item panel ('2,925 - 3,500 / typical range'). -> {name: {"typical": n} or {"low": n, "high": n}}"""
+    out = {}
+    head = next((o for o in lines if norm(o["text"]) == "typical"), None)
+    item = next((o for o in lines if norm(o["text"]) == "item"), None)
+    if head and item:  # the list: a name on the left, its typical price under TYPICAL
+        for o in lines:
+            v = web_num(o["text"])
+            if v is None or o["y"] <= head["y"] + 10 or abs(o["x"] - head["x"]) > 60:
+                continue
+            names = [n for n in lines if item["x"] - 80 <= n["x"] < head["x"] - 120
+                     and o["y"] - 25 <= n["y"] <= o["y"] + 2 and re.search(r"[A-Za-z]{3}", n["text"])]
+            if names:
+                name = min(names, key=lambda n: abs(n["y"] - o["y"]))["text"]
+                out.setdefault(name.strip(), {})["typical"] = v
+    for t in (o for o in lines if norm(o["text"]) == "typicalrange"):  # the panel of one item
+        nums = sorted((o for o in lines if t["y"] - 45 <= o["y"] < t["y"] - 8 and -40 <= o["x"] - t["x"] < 400),
+                      key=lambda o: o["x"])
+        vals = [v for o in nums for v in [web_num(p) for p in re.split(r"\s*[-–]\s*", o["text"])] if v]
+        title = [o for o in lines if t["y"] - 160 <= o["y"] < t["y"] - 45 and abs(o["x"] - t["x"]) < 120
+                 and re.search(r"[A-Za-z]{3}", o["text"]) and not re.search(r"listing|^lv", o["text"], re.I)]
+        if len(vals) >= 2 and title:
+            name = min(title, key=lambda o: o["y"])["text"].strip()
+            out.setdefault(name, {}).update(low=min(vals[:2]), high=max(vals[:2]))
+    return out
+
+
 def ago(t):
     m = int((time.time() - t) // 60)
     return "just now" if m < 1 else f"{m} min ago" if m < 60 else f"{m // 60}h {m % 60:02d}m ago"
@@ -1284,6 +1337,7 @@ class App:
         MEM = Memory()
         dlog("start", version=VERSION, prices=len(self.prices), learned=len(self.learned.prices),
              memory_prices=len(MEM.price), memory_icons=len(MEM.icon))
+        self.web = load_json(WEB_FILE, {})  # meso.watch prices read off the screen: item -> {low, typical, t}
         self.market = load_json(MARKET_FILE, {})  # prices seen in shops: item -> [[unit, shop, when], ...]
         self.newlow = {}  # (item key, shop) -> (unit price, lowest before it) for a 'new lowest price'
         self.cheap_ref = {}  # (item key, shop) -> (unit price, lowest seen before it, how many) when it is cheap, else None
@@ -1644,6 +1698,9 @@ start "" "{sys.executable}"
                         tried = None
                         if getattr(self, "prog_shown", False):  # no shop on the screen: no sign either
                             self.post(self.hide_progress)
+                        if time.time() - getattr(self, "web_t", 0) > 2.5 and web_page_likely(screen):
+                            self.web_t = time.time()
+                            self.learn_web(screen)
                         continue
                     if self.redetect:  # the saved layout didn't fit: look at this same shop again
                         self.redetect, tried = False, None
@@ -1741,6 +1798,7 @@ start "" "{sys.executable}"
         opts = [
             ("npc", "NPC prices - download them again from MeowDB (and forget the ones learned from your sales)", True),
             ("market", f"Market prices seen in shops (the 'lowest of 20' for the blue alert) - {len(self.market):,} items", True),
+            ("web", f"Prices read from meso.watch - {len(self.web):,} items", False),
             ("names", "Learned names and NX items (fixes you made, tooltips read)", False),
             ("memory", "Picture memory (makes reading fast; it fills up again as you play)", False),
             ("tosell", f"'To sell' list - {len(self.bought)} items", False),
@@ -1766,6 +1824,9 @@ start "" "{sys.executable}"
         if "market" in what:
             self.market, self.cheap_ref, self.cheap_seen, self.newlow = {}, {}, set(), {}
             save_json(MARKET_FILE, {})
+        if "web" in what:
+            self.web = {}
+            save_json(WEB_FILE, {})
         if "names" in what:
             self.learned.aliases, self.learned.blocked, self.learned.nx, self.learned.market = {}, {}, set(), {}
             self.learned.save()
@@ -1818,7 +1879,34 @@ start "" "{sys.executable}"
         threading.Thread(target=work, daemon=True).start()
 
     def all_names(self):
-        return sorted(set(self.prices) | set(self.learned.prices) | set(self.learned.market) | self.learned.nx)
+        web = {v.get("name") or k for k, v in getattr(self, "web", {}).items()}
+        return sorted(set(self.prices) | set(self.learned.prices) | set(self.learned.market) | self.learned.nx | web)
+
+    def learn_web(self, screen):
+        """meso.watch is on the screen: remember the prices it shows (detection thread)."""
+        got = read_web_prices(ocr(screen))
+        if not got:
+            return
+        new = 0
+        for name, d in got.items():
+            real, _ = match_name(name, self.names, self.learned)
+            key = norm(real or name)
+            old = self.web.get(key, {})
+            rec = {**old, **d, "name": real or old.get("name") or name, "t": int(time.time())}
+            if rec != {**old, "t": rec["t"]}:
+                new += 1
+            self.web[key] = rec
+        save_json(WEB_FILE, self.web)
+        self.names = self.all_names()
+        dlog("web_prices", got=got)
+        if new:
+            self.say(f"meso.watch: learned {new} price(s) - {len(self.web)} items known")
+
+    def web_ref(self, name):
+        """The meso.watch price to compare with: the low end of its typical range if you opened
+        the item, else its typical price."""
+        d = self.web.get(norm(name or ""))
+        return (d.get("low") or d.get("typical")) if d else None
 
     def market_range(self, item):
         """(lowest, highest, how many) of the prices you typed in, or of the last 20 seen in shops."""
@@ -1862,9 +1950,13 @@ start "" "{sys.executable}"
         pays = self.npc_pays(real, qty) if real else None
         if pays is not None and price <= pays * 1.1:
             return None  # about what an NPC pays anyway: the seller dumps it at the NPC price, no deal
+        web = self.web_ref(self.market_name(v))
         if real in self.learned.market and qty:  # a price you typed in
             low = self.learned.market[real][0]
             got = (price / qty, low) if price / qty < self.cheap_factor(real) * low else None
+        elif web and qty:  # meso.watch (real sales) beats the shop prices seen here
+            name = self.market_name(v)
+            got = (price / qty, web) if price / qty < self.cheap_factor(name) * web else None
         else:
             got = self.cheap_ref.get((real_key(v), self.seen_shop.get(real_key(v), self.cur_shop)))
         return got[:2] if got and (got[1] - got[0]) * qty >= CHEAP_SAVE else None
@@ -2511,12 +2603,14 @@ start "" "{sys.executable}"
                 odd = key in self.odd_name
                 vals, tag = (f"{real or raw} ({'name' if odd else 'price'}?)", qty, f"{price:,}" + ("" if odd else " ?"),
                              "-" if pays is None else f"{pays:,}", "check name" if odd else "check price", shop), "unsure"
-            elif p is None and (self.is_nx(real) or self.cheap(v) or self.market_range(self.market_name(v))):
+            elif p is None and (self.is_nx(real) or self.cheap(v) or self.market_range(self.market_name(v))
+                                or self.web_ref(self.market_name(v))):
                 ch = self.cheap(v)
                 rng = self.market_range(self.market_name(v))
+                web = self.web_ref(self.market_name(v))
                 vals = (f"{'💎 ' if self.is_nx(real) else ''}{real or raw}{times}", qty, f"{price:,}",
                         "NX - no NPC" if self.is_nx(real) else "unknown",
-                        f"low {rng[0]:,} ({rng[2]})" if rng else "-", shop)
+                        f"web {web:,}" if web else f"low {rng[0]:,} ({rng[2]})" if rng else "-", shop)
                 tag = "cheap" if ch else "newlow" if self.new_low(v) else "nx" if self.is_nx(real) else "unknown"
             elif p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
