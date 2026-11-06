@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.95"
+VERSION = "0.96"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1901,8 +1901,8 @@ start "" "{sys.executable}"
         threading.Thread(target=work, daemon=True).start()
 
     def all_names(self):
-        web = {v.get("name") or k for k, v in getattr(self, "web", {}).items()}
-        return sorted(set(self.prices) | set(self.learned.prices) | set(self.learned.market) | self.learned.nx | web)
+        # (not meso.watch's names: 'Brown Matty' was matched to its 'Brown Kitty', one letter apart)
+        return sorted(set(self.prices) | set(self.learned.prices) | set(self.learned.market) | self.learned.nx)
 
     def learn_web(self, screen, mon):
         """meso.watch is on the screen: remember the prices it shows (detection thread), and
@@ -1916,7 +1916,8 @@ start "" "{sys.executable}"
         self.post(self.draw_web_marks, spots, len(self.web) + sum(norm(n) not in self.web for n in got))
         new = 0
         for name, d in got.items():
-            real, _ = match_name(name, self.names, self.learned)
+            real, score = match_name(name, self.names, self.learned)
+            real = real if score == 100 else None  # (the site's own spelling, unless it is exactly a known item)
             key = norm(real or name)
             old = self.web.get(key, {})
             if old.get("typical") and d.get("typical") and time.time() - old.get("t", 0) < 600 \
@@ -1974,6 +1975,22 @@ start "" "{sys.executable}"
                       text=f"✔ read {len(spots)} here · {known} known")
         self.web_win.deiconify()
 
+    def web_price(self, v):
+        """meso.watch's price for this shop row - only for (nearly) the same name as the shop
+        shows it: one misread letter at most, never a look-alike item."""
+        _, raw, _, _ = v
+        for name in (raw, self.market_name(v)):
+            ref = self.web_ref(name)
+            if ref:
+                return ref
+        k = norm(re.sub(r"[.…\s]+$", "", raw or "").split(":")[0])
+        if len(k) >= 8:  # one letter misread (OCR), nothing more
+            hit = next((n for n in self.web if abs(len(n) - len(k)) <= 1 and Levenshtein.distance(n, k) <= 1), None)
+            if hit:
+                d = self.web[hit]
+                return d.get("typical") or d.get("low")
+        return None
+
     def web_ref(self, name):
         """The meso.watch price to compare with: its TYPICAL price from the list (scrolling the
         list is enough), or the low end of its typical range if you opened the item."""
@@ -2024,7 +2041,7 @@ start "" "{sys.executable}"
         pays = self.npc_pays(real, qty) if real else None
         if pays is not None and price <= pays * 1.1:
             return None  # about what an NPC pays anyway: the seller dumps it at the NPC price, no deal
-        web = self.web_ref(self.market_name(v))
+        web = self.web_price(v)
         if real in self.learned.market and qty:  # a price you typed in
             low = self.learned.market[real][0]
             got = (price / qty, low) if price / qty < self.cheap_factor(real) * low else None
@@ -2682,10 +2699,10 @@ start "" "{sys.executable}"
                 vals, tag = (f"{real or raw} ({'name' if odd else 'price'}?)", qty, f"{price:,}" + ("" if odd else " ?"),
                              "-" if pays is None else f"{pays:,}", "check name" if odd else "check price", shop), "unsure"
             elif p is None and (self.is_nx(real) or self.cheap(v) or self.market_range(self.market_name(v))
-                                or self.web_ref(self.market_name(v))):
+                                or self.web_price(v)):
                 ch = self.cheap(v)
                 rng = self.market_range(self.market_name(v))
-                web = self.web_ref(self.market_name(v))
+                web = self.web_price(v)
                 vals = (f"{'💎 ' if self.is_nx(real) else ''}{real or raw}{times}", qty, f"{price:,}",
                         "NX - no NPC" if self.is_nx(real) else "unknown",
                         (f"-{pct_off(ch[0], ch[1])}%" if ch else f"web {web:,}" if web
