@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.92"
+VERSION = "0.94"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -959,6 +959,12 @@ def web_num(text):
         return None
 
 
+def small(img):
+    """A small copy of the screen, to notice it changed (scrolling). The ✔ drawn over the page
+    change well under 1% of it, so they don't count as a change themselves."""
+    return np.ascontiguousarray(img[::8, ::8])
+
+
 def web_page_likely(img):
     """meso.watch's orange tabs are on the screen (cheap check before reading the page)."""
     a = img[::4, ::4].astype(np.int16)
@@ -985,7 +991,10 @@ def read_web_prices(lines):
                      and o["y"] - 25 <= n["y"] <= o["y"] + 2 and re.search(r"[A-Za-z]{3}", n["text"])]
             if names:
                 name = min(names, key=lambda n: abs(n["y"] - o["y"]))["text"]
-                out.setdefault(name.strip(), {})["typical"] = v
+                d = out.setdefault(name.strip(), {})
+                if d.get("typical") and d["typical"] != v:  # the same name twice (scroll tiers: the
+                    d["dup"] = True  # list doesn't say which): keep the lower - never a false alert
+                d["typical"] = min(v, d.get("typical") or v)
     for t in (o for o in lines if norm(o["text"]) == "typicalrange"):  # the panel of one item
         nums = sorted((o for o in lines if t["y"] - 45 <= o["y"] < t["y"] - 8 and -40 <= o["x"] - t["x"] < 400),
                       key=lambda o: o["x"])
@@ -1707,9 +1716,13 @@ start "" "{sys.executable}"
                         tried = None
                         if getattr(self, "prog_shown", False):  # no shop on the screen: no sign either
                             self.post(self.hide_progress)
+                        if getattr(self, "web_marks_on", False) and changed(small(screen), self.web_sig, 0.01):
+                            self.web_marks_on = False  # scrolled: the ✔ would point at other items
+                            self.post(self.draw_web_marks, [], 0)
+                            self.web_t = time.time() - 1.5  # read the new screen soon
                         if time.time() - getattr(self, "web_t", 0) > 2.5 and web_page_likely(screen):
                             self.web_t = time.time()
-                            self.learn_web(screen)
+                            self.learn_web(screen, mon)
                         continue
                     if self.redetect:  # the saved layout didn't fit: look at this same shop again
                         self.redetect, tried = False, None
@@ -1891,16 +1904,24 @@ start "" "{sys.executable}"
         web = {v.get("name") or k for k, v in getattr(self, "web", {}).items()}
         return sorted(set(self.prices) | set(self.learned.prices) | set(self.learned.market) | self.learned.nx | web)
 
-    def learn_web(self, screen):
-        """meso.watch is on the screen: remember the prices it shows (detection thread)."""
-        got = read_web_prices(ocr(screen))
+    def learn_web(self, screen, mon):
+        """meso.watch is on the screen: remember the prices it shows (detection thread), and
+        put a ✔ next to each item read - on the page itself, so it shows in the mini mode too."""
+        lines = ocr(screen)
+        got = read_web_prices(lines)
         if not got:
             return
+        spots = [(o["x"] + mon["left"], o["y"] + mon["top"]) for o in lines if o["text"].strip() in got]
+        self.web_sig = small(screen)  # the page as read: when it scrolls, the ✔ go until it's read again
+        self.post(self.draw_web_marks, spots, len(self.web) + sum(norm(n) not in self.web for n in got))
         new = 0
         for name, d in got.items():
             real, _ = match_name(name, self.names, self.learned)
             key = norm(real or name)
             old = self.web.get(key, {})
+            if old.get("typical") and d.get("typical") and time.time() - old.get("t", 0) < 600 \
+                    and max(old["typical"], d["typical"]) > 1.5 * min(old["typical"], d["typical"]):
+                d = {**d, "typical": min(old["typical"], d["typical"]), "dup": True}  # (another tier, a screen later)
             rec = {**old, **d, "name": real or old.get("name") or name, "t": int(time.time())}
             if rec != {**old, "t": rec["t"]}:
                 new += 1
@@ -1908,13 +1929,57 @@ start "" "{sys.executable}"
         save_json(WEB_FILE, self.web)
         self.names = self.all_names()
         dlog("web_prices", got=got)
-        if new:
-            self.say(f"meso.watch: learned {new} price(s) - {len(self.web)} items known")
+        self.say(f"meso.watch: ✔ {len(got)} read on this screen - {len(self.web)} items known"
+                 + (f" ({new} new)" if new else ""))
+
+    def draw_web_marks(self, spots, known):
+        """✔ next to each meso.watch item that was just read (click-through overlay)."""
+        self.web_marks_on = bool(spots)
+        if not spots or not self.show_marks.get():
+            if getattr(self, "web_win", None):
+                self.web_win.withdraw()
+            return
+        if not getattr(self, "web_win", None):
+            w = tk.Toplevel(self.root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            w.configure(bg="#ff00ff")
+            try:
+                w.attributes("-transparentcolor", "#ff00ff")
+            except tk.TclError:
+                w.attributes("-alpha", 0.7)
+            self.web_canvas = tk.Canvas(w, bg="#ff00ff", highlightthickness=0)
+            self.web_canvas.pack(fill="both", expand=True)
+            w.update_idletasks()
+            try:  # clicks go through to the browser
+                hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+                ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
+            except Exception:
+                pass
+            with mss.mss() as sct:
+                self.web_mon = sct.monitors[0]
+            m = self.web_mon
+            w.geometry(f"{m['width']}x{m['height']}+{m['left']}+{m['top']}")
+            self.web_win = w
+        m, c = self.web_mon, self.web_canvas
+        c.delete("all")
+        for x, y in spots:
+            x, y = x - m["left"], y - m["top"]
+            c.create_oval(x - 34, y - 11, x - 12, y + 11, fill="#18c43a", outline="#0b7a22", width=2)
+            c.create_text(x - 23, y, text="✔", fill="#ffffff", font=("Segoe UI", 10, "bold"))
+        x0, y0 = min(p[0] for p in spots) - m["left"], min(p[1] for p in spots) - m["top"]
+        c.create_rectangle(x0 - 40, y0 - 52, x0 + 230, y0 - 26, fill="#18c43a", outline="#0b7a22")
+        c.create_text(x0 - 32, y0 - 39, anchor="w", fill="#ffffff", font=("Segoe UI", 10, "bold"),
+                      text=f"✔ read {len(spots)} here · {known} known")
+        self.web_win.deiconify()
 
     def web_ref(self, name):
         """The meso.watch price to compare with: its TYPICAL price from the list (scrolling the
         list is enough), or the low end of its typical range if you opened the item."""
         d = self.web.get(norm(name or ""))
+        if not d and ":" in (name or ""):  # 'Earring DEX Scroll: Inter...' -> the site's 'Earring DEX Scroll'
+            d = self.web.get(norm(name.split(":")[0]))
         return (d.get("typical") or d.get("low")) if d else None
 
     def market_range(self, item):

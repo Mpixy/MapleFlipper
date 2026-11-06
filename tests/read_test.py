@@ -120,6 +120,12 @@ def main():
     ok = got == want and mf.web_page_likely(img)
     bad += not ok
     print(f"{'ok  ' if ok else 'FAIL'} web19.png: {len(got)}/10 rows" + ("" if ok else f" {got}"))
+    img = cv2.imread(os.path.join(HERE, "web20.png"))  # scrolls: one name twice (two tiers) -> the lower
+    got = mf.read_web_prices(mf.ocr(img))
+    ok = (len(got) == 8 and got.get("OverallArmorDEXScroll") == {"typical": 20000, "dup": True}
+          and got.get("Wand MagicAttackScroll", {}).get("typical") == 327000)
+    bad += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} web20.png: {len(got)} scrolls" + ("" if ok else f" {got}"))
     for shot in ("5.png", "7.png", "8.png", "9.png", "11.png", "13.png", "map17.png"):  # the game is never the site
         if mf.web_page_likely(cv2.imread(os.path.join(HERE, shot))):
             bad += 1
