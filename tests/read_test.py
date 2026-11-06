@@ -112,7 +112,15 @@ def main():
     ok = web.get("EmeraldStaff") == {"typical": 3050, "low": 2925, "high": 3500}
     bad += not ok
     print(f"{'ok  ' if ok else 'FAIL'} web18.png: {web}")
-    for shot in ("9.png", "11.png", "map17.png"):  # the game is never taken for the site
+    want = {"Race Ace Cap": 48500, "Detective Hat": 33000, "Demon Goblin": 150000, "Stylish Pink Cotton Cap": 50000,
+            "White Bandage": 49000, "Toy Rifle": 49000, "Brown Kitty": 80000, "Brown Dress Shoes": 33300,
+            "Tiger Mask": 30000, "Violet Dot Jeans": 30000}
+    img = cv2.imread(os.path.join(HERE, "web19.png"))  # the NX list, scrolled (no orange tabs)
+    got = {k: v.get("typical") for k, v in mf.read_web_prices(mf.ocr(img)).items()}
+    ok = got == want and mf.web_page_likely(img)
+    bad += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} web19.png: {len(got)}/10 rows" + ("" if ok else f" {got}"))
+    for shot in ("5.png", "7.png", "8.png", "9.png", "11.png", "13.png", "map17.png"):  # the game is never the site
         if mf.web_page_likely(cv2.imread(os.path.join(HERE, shot))):
             bad += 1
             print(f"FAIL {shot}: taken for meso.watch")
