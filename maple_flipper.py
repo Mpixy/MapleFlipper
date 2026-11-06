@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.87"
+VERSION = "0.88"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1423,6 +1423,7 @@ class App:
         vol.bind("<ButtonRelease-1>", lambda e: (self.cfg.__setitem__("volume", self.volume.get()),
                                                  save_json(CONFIG_FILE, self.cfg), soft_ping()))
         ttk.Button(bar, text="Update prices", command=self.update_db).pack(side="right")
+        ttk.Button(bar, text="Reset...", command=self.reset_dialog).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="? Help", command=self.show_help).pack(side="right", padx=6)
         ttk.Button(bar, text="▭ Mini (F9)", command=self.toggle_mini).pack(side="right")
         ttk.Button(bar, text="Shops", command=self.shops_window).pack(side="right", padx=(0, 6))
@@ -1728,6 +1729,65 @@ start "" "{sys.executable}"
         threading.Thread(target=loop, daemon=True).start()
 
     # ---- prices
+    def reset_dialog(self):
+        """Start parts of what the app knows from scratch."""
+        top = tk.Toplevel(self.root)
+        top.title("Reset")
+        top.attributes("-topmost", True)
+        ttk.Label(top, text="What should start from scratch?", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        opts = [
+            ("npc", "NPC prices - download them again from MeowDB (and forget the ones learned from your sales)", True),
+            ("market", f"Market prices seen in shops (the 'lowest of 20' for the blue alert) - {len(self.market):,} items", True),
+            ("names", "Learned names and NX items (fixes you made, tooltips read)", False),
+            ("memory", "Picture memory (makes reading fast; it fills up again as you play)", False),
+            ("tosell", f"'To sell' list - {len(self.bought)} items", False),
+        ]
+        picks = {}
+        for key, text, on in opts:
+            picks[key] = tk.BooleanVar(value=on)
+            ttk.Checkbutton(top, text=text, variable=picks[key]).pack(anchor="w", padx=12, pady=2)
+
+        def go():
+            chosen = [k for k, v in picks.items() if v.get()]
+            if not chosen or not messagebox.askyesno("Reset", "Reset what you ticked? This can't be undone.", parent=top):
+                return
+            top.destroy()
+            self.reset(chosen)
+        row = ttk.Frame(top)
+        row.pack(fill="x", padx=12, pady=10)
+        ttk.Button(row, text="Reset", command=go).pack(side="right")
+        ttk.Button(row, text="Cancel", command=top.destroy).pack(side="right", padx=6)
+
+    def reset(self, what):
+        dlog("reset", what=what)
+        if "market" in what:
+            self.market, self.cheap_ref, self.cheap_seen = {}, {}, set()
+            save_json(MARKET_FILE, {})
+        if "names" in what:
+            self.learned.aliases, self.learned.blocked, self.learned.nx, self.learned.market = {}, {}, set(), {}
+            self.learned.save()
+        if "memory" in what:
+            if MEM:
+                with MEM.lock:
+                    MEM.price, MEM.icon, MEM.names, MEM.dirty = {}, {}, {}, True
+                MEM.save(force=True)
+            _rec_cache.clear()
+        if "tosell" in what:
+            self.bought.clear()
+            self.save_stats()
+        if "npc" in what:
+            self.learned.prices = {k: v for k, v in self.learned.prices.items() if k in self.learned.manual}
+            self.learned.save()
+            for f in (PRICES_FILE, PRICES_FILE + ".progress"):
+                if os.path.exists(f):
+                    os.remove(f)
+            self.prices = load_prices()  # the list that came with the app, until the download is in
+            self.update_db()
+        self.names = self.all_names()
+        self.rematch()
+        self.show_stats()
+        self.say("Reset: " + ", ".join(what) + (" - downloading NPC prices..." if "npc" in what else "."))
+
     def update_db(self):
         if self.updating:
             return
