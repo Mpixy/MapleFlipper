@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.94"
+VERSION = "0.95"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -2030,6 +2030,10 @@ start "" "{sys.executable}"
             got = (price / qty, low) if price / qty < self.cheap_factor(real) * low else None
         elif web and qty:  # meso.watch (real sales) beats the shop prices seen here: under 80%
             got = (price / qty, web) if price / qty < CHEAP * web else None
+            if got and got[0] < 0.15 * web:
+                # 85%+ off is another item with the same name (Orange Mushroom Cap: the ETC drop
+                # for 100, the site's hat for 14,200), not a deal
+                got = None
         else:
             got = self.cheap_ref.get((real_key(v), self.seen_shop.get(real_key(v), self.cur_shop)))
         return got[:2] if got and (got[1] - got[0]) * qty >= CHEAP_SAVE else None
@@ -3179,7 +3183,7 @@ start "" "{sys.executable}"
                 pass
             self.overlay = ov
         pad = 70  # (the overlay starts a bit left of the watched area)
-        w = box["width"] + pad + 140
+        w = box["width"] + pad + 330  # (room for '-27%  (usually 48,500)' next to the rows)
         self.overlay.geometry(f"{w}x{box['height']}+{box['left'] - pad}+{box['top']}")
         self.overlay.deiconify()
         c = self.ov_canvas
