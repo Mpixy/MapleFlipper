@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.88"
+VERSION = "0.89"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -44,6 +44,7 @@ MARKET_MIN = 5  # prices needed before the app compares (fewer says too little)
 CHEAP = 0.8  # under 80% of the lowest of those prices = a blue 'cheap' alert
 CHEAP_NX = 0.75  # NX items and scrolls: under 75%
 CHEAP_SAVE = 1000  # ...and at least this much under it (94 instead of 125 is no news)
+NEWLOW_MIN, NEWLOW_SAVE = 10000, 1500  # 'new lowest': items worth 10,000+, at least 1,500 under the lowest
 REPO_ZIP = "https://github.com/Mpixy/MapleFlipper/archive/refs/heads/main.zip"
 RELEASE = "https://github.com/Mpixy/MapleFlipper/releases/download/latest/"
 FROZEN = getattr(sys, "frozen", False)  # running as MapleFlipper.exe
@@ -1284,6 +1285,7 @@ class App:
         dlog("start", version=VERSION, prices=len(self.prices), learned=len(self.learned.prices),
              memory_prices=len(MEM.price), memory_icons=len(MEM.icon))
         self.market = load_json(MARKET_FILE, {})  # prices seen in shops: item -> [[unit, shop, when], ...]
+        self.newlow = {}  # (item key, shop) -> (unit price, lowest before it) for a 'new lowest price'
         self.cheap_ref = {}  # (item key, shop) -> (unit price, lowest seen before it, how many) when it is cheap, else None
         self.cheap_seen = set()  # (item key, shop) already pinged as cheap
         self.badge_last = None
@@ -1446,6 +1448,7 @@ class App:
         self.tree.tag_configure("unsure", background="#ffe7a8")
         self.tree.tag_configure("watch", background="#e7d4f7")
         self.tree.tag_configure("cheap", background="#c7e2ff")
+        self.tree.tag_configure("newlow", background="#d3f4f7")
         self.tree.tag_configure("nx", foreground="#7a5cc0")
         self.tree.tag_configure("bought", background="#9cc8ff", font=("Segoe UI", 9, "bold"))
         self.tree.pack(fill="both", expand=True, padx=8, pady=6)
@@ -1761,7 +1764,7 @@ start "" "{sys.executable}"
     def reset(self, what):
         dlog("reset", what=what)
         if "market" in what:
-            self.market, self.cheap_ref, self.cheap_seen = {}, {}, set()
+            self.market, self.cheap_ref, self.cheap_seen, self.newlow = {}, {}, set(), {}
             save_json(MARKET_FILE, {})
         if "names" in what:
             self.learned.aliases, self.learned.blocked, self.learned.nx, self.learned.market = {}, {}, set(), {}
@@ -1876,7 +1879,38 @@ start "" "{sys.executable}"
         rng = self.market_range(name)
         self.cheap_ref[key, self.cur_shop] = ((unit, rng[0], rng[2]) if rng and unit < self.cheap_factor(name) * rng[0]
                                               else None)
+        # not 20% cheaper, but under every price seen lately - on a pricey item that is real money
+        self.newlow[key, self.cur_shop] = ((unit, rng[0]) if rng and rng[0] >= NEWLOW_MIN
+                                           and (rng[0] - unit) * qty >= NEWLOW_SAVE else None)
         return self.see_price(name, unit)
+
+    def new_low(self, v):
+        """Under the lowest of the last 20 prices (an item worth 10,000+)? -> (unit, that lowest)"""
+        if self.cheap(v):
+            return None  # (that is the stronger blue alert already)
+        pays = self.npc_pays(v[0], v[2]) if v[0] else None
+        if pays is not None and v[3] <= pays * 1.1:
+            return None
+        return self.newlow.get((real_key(v), self.seen_shop.get(real_key(v), self.cur_shop)))
+
+    def price_history(self, v):
+        """The prices seen for this item lately: lowest first, with the shop and when."""
+        name = self.market_name(v)
+        seen = sorted(self.market.get(name, []))
+        top = tk.Toplevel(self.root)
+        top.title(f"Prices of {name}")
+        top.attributes("-topmost", True)
+        if not seen:
+            ttk.Label(top, text=f"No prices seen for '{name}' yet.", padding=12).pack()
+            return
+        units = [u for u, _, _ in seen]
+        ttk.Label(top, padding=(12, 10, 12, 4), font=("Segoe UI", 10, "bold"),
+                  text=f"{name}: {len(seen)} prices (each) - lowest {units[0]:,}, "
+                       f"middle {units[len(units) // 2]:,}, highest {units[-1]:,}").pack(anchor="w")
+        lst = tk.Listbox(top, width=46, height=min(20, len(seen)), font=("Consolas", 10))
+        lst.pack(padx=12, pady=(0, 12))
+        for u, shop, t in seen:
+            lst.insert("end", f"{u:>12,}   {(shop or '?')[:16]:<16} {ago(t)}")
 
     def check_cash(self, screen):
         """A tooltip with the red C coin is on the screen: whatever item it shows is NX. Learned
@@ -2200,13 +2234,16 @@ start "" "{sys.executable}"
             if sure and self.judge_price(key, v):
                 market_new = True
             cheap = sure and not good and self.cheap(v)
-            if cheap and (key, self.cur_shop) not in self.cheap_seen:
+            low = sure and not good and not cheap and self.new_low(v)
+            if (cheap or low) and (key, self.cur_shop) not in self.cheap_seen:
                 self.cheap_seen.add((key, self.cur_shop))
                 new_cheap.append(v)
             if rects and (good or watched):
                 marks.append((rects[i], p if good else None))
             elif rects and cheap:
                 marks.append((rects[i], ("cheap", cheap[1])))
+            elif rects and low:
+                marks.append((rects[i], ("low", low[1])))
         self.count.update(page)
         for name, qty, price, sure in items:
             real, score = match_name(name, self.names, self.learned)
@@ -2309,6 +2346,8 @@ start "" "{sys.executable}"
         here = [(p, v) for p, v in here if p is not None and p > 0 and p >= self.min_p()]
         cheap = [(v, self.cheap(v)) for k, v in self.seen.items() if self.seen_shop.get(k) == self.cur_shop
                  and k not in self.unsure and k not in self.bought_keys and self.cheap(v)]
+        lows = [(v, self.new_low(v)) for k, v in self.seen.items() if self.seen_shop.get(k) == self.cur_shop
+                and k not in self.unsure and k not in self.bought_keys and self.new_low(v)]
         eye = "   👀 " + ", ".join(f"{v[0] or v[1]} {v[3]:,}" for v in watched[:2]) if watched else ""
         if here:
             # what you can click right now first, then the rest of the shop
@@ -2330,6 +2369,9 @@ start "" "{sys.executable}"
             v, (unit, low) = cheap[0]
             more = f"  (+{len(cheap) - 1} more)" if len(cheap) > 1 else ""
             self.set_banner(f"🔵 CHEAP: {v[0] or v[1]}  for {v[3]:,}  (lowest seen {low:,}){more}{eye}", "#2b8cff", "#fff")
+        elif lows:
+            v, (unit, low) = lows[0]
+            self.set_banner(f"⬇ NEW LOW: {v[0] or v[1]}  for {v[3]:,}  (lowest before {low:,}){eye}", "#19b5c9", "#fff")
         elif watched:
             v = watched[0]
             self.set_banner(f"👀 WATCHED: {v[0] or v[1]}  for {v[3]:,}" + (f"  (+{len(watched) - 1} more)"
@@ -2475,14 +2517,15 @@ start "" "{sys.executable}"
                 vals = (f"{'💎 ' if self.is_nx(real) else ''}{real or raw}{times}", qty, f"{price:,}",
                         "NX - no NPC" if self.is_nx(real) else "unknown",
                         f"low {rng[0]:,} ({rng[2]})" if rng else "-", shop)
-                tag = "cheap" if ch else "nx" if self.is_nx(real) else "unknown"
+                tag = "cheap" if ch else "newlow" if self.new_low(v) else "nx" if self.is_nx(real) else "unknown"
             elif p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
             else:
                 mark = " ✓" if real in self.learned.prices else ""
                 prof = f"{p:+,}" + (f" ×{n}" if n > 1 and p > 0 else "")
                 vals = (real + times, qty, f"{price:,}", f"{self.npc_pays(real, qty):,}{mark}", prof, shop)
-                tag = "good" if p > 0 and p >= self.min_p() else "cheap" if self.cheap(v) else "bad"
+                tag = ("good" if p > 0 and p >= self.min_p() else "cheap" if self.cheap(v)
+                       else "newlow" if self.new_low(v) else "bad")
             if watched and tag != "bought":
                 vals = ("👀 " + vals[0],) + vals[1:]
                 if tag != "good":
@@ -2523,6 +2566,8 @@ start "" "{sys.executable}"
                 m.add_command(label=f"💎 '{real}' is an NX item (NPCs don't buy it)",
                               command=lambda: (self.learned.mark_nx(real), self.refresh()))
             m.add_command(label=f"Set market price of '{real}' by hand...", command=lambda: self.ask_market(real))
+        if self.market_name(v):
+            m.add_command(label="📈 Prices seen lately...", command=lambda: self.price_history(v))
             if real in self.learned.prices:
                 m.add_command(label="Forget what was learned for this item",
                               command=lambda: (self.learned.forget(real), self.rematch()))
@@ -2973,10 +3018,11 @@ start "" "{sys.executable}"
         best = max((p for _, p in marks if isinstance(p, int)), default=None)
         for (x, y, rw, rh), p in marks:
             x += pad
-            if isinstance(p, tuple):  # under 80% of the lowest price seen lately
-                c.create_rectangle(x, y, x + rw, y + rh, outline="#2b8cff", width=3)
-                c.create_text(x + rw + 6, y + rh / 2, anchor="w", text=f"CHEAP (low {p[1]:,})",
-                              fill="#2b8cff", font=("Segoe UI", 11, "bold"))
+            if isinstance(p, tuple):  # under 80% of the lowest price seen lately / a new lowest
+                col = "#2b8cff" if p[0] == "cheap" else "#19b5c9"
+                c.create_rectangle(x, y, x + rw, y + rh, outline=col, width=3)
+                c.create_text(x + rw + 6, y + rh / 2, anchor="w", fill=col, font=("Segoe UI", 11, "bold"),
+                              text=f"CHEAP (low {p[1]:,})" if p[0] == "cheap" else f"NEW LOW (was {p[1]:,})")
                 continue
             if p is None:  # an item on your watch list
                 c.create_rectangle(x, y, x + rw, y + rh, outline="#b44dff", width=4)
