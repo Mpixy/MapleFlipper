@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.91"
+VERSION = "0.92"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -963,7 +963,11 @@ def web_page_likely(img):
     """meso.watch's orange tabs are on the screen (cheap check before reading the page)."""
     a = img[::4, ::4].astype(np.int16)
     b, g, r = a[..., 0], a[..., 1], a[..., 2]
-    return ((abs(r - 252) < 12) & (abs(g - 168) < 18) & (abs(b - 69) < 20)).mean() > 0.004
+    orange = ((abs(r - 252) < 12) & (abs(g - 168) < 18) & (abs(b - 69) < 20)).mean()
+    # (scrolled down, the tabs are gone: the cream page in its dark brown frame)
+    cream = ((r > 245) & (abs(g - 245) < 10) & (abs(b - 228) < 18)).mean()
+    brown = ((abs(r - 122) < 25) & (abs(g - 59) < 20) & (b < 40)).mean()
+    return orange > 0.004 or (cream > 0.1 and brown > 0.002)
 
 
 def read_web_prices(lines):
@@ -992,6 +996,11 @@ def read_web_prices(lines):
             name = min(title, key=lambda o: o["y"])["text"].strip()
             out.setdefault(name, {}).update(low=min(vals[:2]), high=max(vals[:2]))
     return out
+
+
+def pct_off(unit, ref):
+    """How much under the usual price, in whole percent (20000 vs 28000 -> 29)."""
+    return int(round(100 * (1 - unit / ref))) if ref else 0
 
 
 def ago(t):
@@ -1903,13 +1912,10 @@ start "" "{sys.executable}"
             self.say(f"meso.watch: learned {new} price(s) - {len(self.web)} items known")
 
     def web_ref(self, name):
-        """The meso.watch price to compare with: the low end of its typical range if you opened
-        the item, else 90% of its typical price from the list (the range's low end is usually
-        a little under it: Emerald Staff 2,925 vs 3,050) - scrolling the list is enough."""
+        """The meso.watch price to compare with: its TYPICAL price from the list (scrolling the
+        list is enough), or the low end of its typical range if you opened the item."""
         d = self.web.get(norm(name or ""))
-        if not d:
-            return None
-        return d.get("low") or (int(d["typical"] * 0.9) if d.get("typical") else None)
+        return (d.get("typical") or d.get("low")) if d else None
 
     def market_range(self, item):
         """(lowest, highest, how many) of the prices you typed in, or of the last 20 seen in shops."""
@@ -1957,9 +1963,8 @@ start "" "{sys.executable}"
         if real in self.learned.market and qty:  # a price you typed in
             low = self.learned.market[real][0]
             got = (price / qty, low) if price / qty < self.cheap_factor(real) * low else None
-        elif web and qty:  # meso.watch (real sales) beats the shop prices seen here
-            name = self.market_name(v)
-            got = (price / qty, web) if price / qty < self.cheap_factor(name) * web else None
+        elif web and qty:  # meso.watch (real sales) beats the shop prices seen here: under 80%
+            got = (price / qty, web) if price / qty < CHEAP * web else None
         else:
             got = self.cheap_ref.get((real_key(v), self.seen_shop.get(real_key(v), self.cur_shop)))
         return got[:2] if got and (got[1] - got[0]) * qty >= CHEAP_SAVE else None
@@ -2336,7 +2341,7 @@ start "" "{sys.executable}"
             if rects and (good or watched):
                 marks.append((rects[i], p if good else None))
             elif rects and cheap:
-                marks.append((rects[i], ("cheap", cheap[1])))
+                marks.append((rects[i], ("cheap", cheap[1], pct_off(cheap[0], cheap[1]))))
             elif rects and low:
                 marks.append((rects[i], ("low", low[1])))
         self.count.update(page)
@@ -2463,7 +2468,8 @@ start "" "{sys.executable}"
         elif cheap:
             v, (unit, low) = cheap[0]
             more = f"  (+{len(cheap) - 1} more)" if len(cheap) > 1 else ""
-            self.set_banner(f"🔵 CHEAP: {v[0] or v[1]}  for {v[3]:,}  (lowest seen {low:,}){more}{eye}", "#2b8cff", "#fff")
+            self.set_banner(f"🔵 CHEAP -{pct_off(unit, low)}%: {v[0] or v[1]}  for {v[3]:,}  (usually {low:,}){more}{eye}",
+                            "#2b8cff", "#fff")
         elif lows:
             v, (unit, low) = lows[0]
             self.set_banner(f"⬇ NEW LOW: {v[0] or v[1]}  for {v[3]:,}  (lowest before {low:,}){eye}", "#19b5c9", "#fff")
@@ -2613,7 +2619,8 @@ start "" "{sys.executable}"
                 web = self.web_ref(self.market_name(v))
                 vals = (f"{'💎 ' if self.is_nx(real) else ''}{real or raw}{times}", qty, f"{price:,}",
                         "NX - no NPC" if self.is_nx(real) else "unknown",
-                        f"web {web:,}" if web else f"low {rng[0]:,} ({rng[2]})" if rng else "-", shop)
+                        (f"-{pct_off(ch[0], ch[1])}%" if ch else f"web {web:,}" if web
+                         else f"low {rng[0]:,} ({rng[2]})" if rng else "-"), shop)
                 tag = "cheap" if ch else "newlow" if self.new_low(v) else "nx" if self.is_nx(real) else "unknown"
             elif p is None:
                 vals, tag = (f"{raw} (?)", qty, f"{price:,}", "unknown", "-", shop), "unknown"
@@ -3119,7 +3126,7 @@ start "" "{sys.executable}"
                 col = "#2b8cff" if p[0] == "cheap" else "#19b5c9"
                 c.create_rectangle(x, y, x + rw, y + rh, outline=col, width=3)
                 c.create_text(x + rw + 6, y + rh / 2, anchor="w", fill=col, font=("Segoe UI", 11, "bold"),
-                              text=f"CHEAP (low {p[1]:,})" if p[0] == "cheap" else f"NEW LOW (was {p[1]:,})")
+                              text=f"-{p[2]}%  (usually {p[1]:,})" if p[0] == "cheap" else f"NEW LOW (was {p[1]:,})")
                 continue
             if p is None:  # an item on your watch list
                 c.create_rectangle(x, y, x + rw, y + rh, outline="#b44dff", width=4)
