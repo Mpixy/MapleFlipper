@@ -27,7 +27,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.90"
+VERSION = "0.91"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "MapleFlipper")
 os.makedirs(DATA, exist_ok=True)
@@ -1904,9 +1904,12 @@ start "" "{sys.executable}"
 
     def web_ref(self, name):
         """The meso.watch price to compare with: the low end of its typical range if you opened
-        the item, else its typical price."""
+        the item, else 90% of its typical price from the list (the range's low end is usually
+        a little under it: Emerald Staff 2,925 vs 3,050) - scrolling the list is enough."""
         d = self.web.get(norm(name or ""))
-        return (d.get("low") or d.get("typical")) if d else None
+        if not d:
+            return None
+        return d.get("low") or (int(d["typical"] * 0.9) if d.get("typical") else None)
 
     def market_range(self, item):
         """(lowest, highest, how many) of the prices you typed in, or of the last 20 seen in shops."""
