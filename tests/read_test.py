@@ -107,6 +107,15 @@ def main():
         bad += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {shot}: read {len(got)}/{len(real)}"
               + (f"  WRONG {wrong}" if wrong else "") + (f"  missed {left}" if left else ""))
+    # meso.watch, read off the screen: the list row and the item panel
+    web = mf.read_web_prices(mf.ocr(cv2.imread(os.path.join(HERE, "web18.png"))))
+    ok = web.get("EmeraldStaff") == {"typical": 3050, "low": 2925, "high": 3500}
+    bad += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} web18.png: {web}")
+    for shot in ("9.png", "11.png", "map17.png"):  # the game is never taken for the site
+        if mf.web_page_likely(cv2.imread(os.path.join(HERE, shot))):
+            bad += 1
+            print(f"FAIL {shot}: taken for meso.watch")
     print("all good" if not bad else f"{bad} shot(s) failed")
     return bad
 
